@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import random
 import re
 import shlex
 import signal
@@ -25,6 +24,7 @@ DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 DEFAULT_OUTPUT_NAME = "audiobook.wav"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_PAUSE_MS = 300
+DEFAULT_MAX_INFERENCE_CHARS = 2600
 DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
 DEFAULT_DTYPE = "float16"
 
@@ -153,8 +153,15 @@ class StopController:
 
 
 class DefragProgressView:
-    MAP_COLS = 72
-    MAP_ROWS = 10
+    CHARS_PER_BLOCK = 200
+    BLOCKS_PER_ROW = 120
+    DONE_FLASH_SECONDS = 1.4
+    COLOR_RESET = "\x1b[0m"
+    COLOR_RED = "\x1b[91m"
+    COLOR_BLUE = "\x1b[94m"
+    COLOR_GREEN = "\x1b[92m"
+    COLOR_WHITE = "\x1b[97m"
+    COLOR_DIM = "\x1b[90m"
 
     def __init__(
         self,
@@ -163,6 +170,7 @@ class DefragProgressView:
         completed_batches: int,
         completed_chars: int,
         enabled: bool,
+        batch_char_counts: list[int] | None = None,
     ) -> None:
         self.total_batches = max(1, total_batches)
         self.total_chars = max(1, total_chars)
@@ -172,6 +180,8 @@ class DefragProgressView:
         self.current_batch = 0
         self.current_batch_chars = 0
         self.current_batch_label = "idle"
+        self.active_batch_start = 0
+        self.active_batch_end = 0
         self.stop_requested = False
         self.status = "Loading model..."
         self._batch_durations: list[float] = []
@@ -180,10 +190,18 @@ class DefragProgressView:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
-        self._map_cells = self.MAP_COLS * self.MAP_ROWS
-        used_ratio = 0.60 + (self.total_chars / (self.total_chars + 18000.0)) * 0.22
-        self._used_cells = max(1, min(self._map_cells, int(self._map_cells * used_ratio)))
-        self._fragmented_layout = self._build_fragmented_layout()
+        self._done_flash_until: dict[int, float] = {}
+
+        if batch_char_counts and len(batch_char_counts) == self.total_batches:
+            normalized = [max(1, int(v)) for v in batch_char_counts]
+        else:
+            avg_chars = max(1, self.total_chars // self.total_batches)
+            normalized = [avg_chars for _ in range(self.total_batches)]
+        self._batch_char_counts = normalized
+        self._batch_block_counts = [
+            max(1, (chars + self.CHARS_PER_BLOCK - 1) // self.CHARS_PER_BLOCK)
+            for chars in self._batch_char_counts
+        ]
 
     def start(self) -> None:
         if not self.enabled:
@@ -201,6 +219,7 @@ class DefragProgressView:
         batch_chars: int,
         message: str,
         batch_label: str | None = None,
+        active_batch_count: int = 1,
     ) -> None:
         with self._lock:
             self.current_batch = batch_number
@@ -210,12 +229,18 @@ class DefragProgressView:
                 if batch_label
                 else f"batch {batch_number}/{self.total_batches} ({batch_chars} chars)"
             )
+            self.active_batch_start = max(1, batch_number)
+            self.active_batch_end = min(
+                self.total_batches, batch_number + max(1, active_batch_count) - 1
+            )
             self.status = message
 
     def mark_batch_complete(self, batch_chars: int, duration_seconds: float) -> None:
         with self._lock:
             self.completed_batches += 1
             self.completed_chars += batch_chars
+            just_done = self.completed_batches
+            self._done_flash_until[just_done] = time.time() + self.DONE_FLASH_SECONDS
             self.current_batch = 0
             self.current_batch_chars = 0
             self.current_batch_label = "idle"
@@ -257,24 +282,33 @@ class DefragProgressView:
             sys.stdout.write("\n")
         sys.stdout.flush()
 
-    def _build_fragmented_layout(self) -> list[int]:
-        seed = self.total_chars + self.total_batches * 113 + self.completed_batches * 17
-        rng = random.Random(seed)
-        reserve_left = max(8, self._map_cells // 9)
-        candidates = list(range(reserve_left, self._map_cells))
-        if self._used_cells > len(candidates):
-            return list(range(self._used_cells))
-        picked = sorted(rng.sample(candidates, self._used_cells))
-        return picked
+    def _batch_color(
+        self,
+        batch_number: int,
+        completed_batches: int,
+        active_start: int,
+        active_end: int,
+        now_ts: float,
+        done_flash_until: dict[int, float],
+    ) -> str:
+        if active_start <= batch_number <= active_end:
+            return self.COLOR_BLUE
+        if batch_number <= completed_batches:
+            if done_flash_until.get(batch_number, 0.0) > now_ts:
+                return self.COLOR_GREEN
+            return self.COLOR_WHITE
+        return self.COLOR_RED
 
     def _build_frame(self) -> str:
         with self._lock:
             completed_batches = self.completed_batches
             completed_chars = self.completed_chars
-            current_batch = self.current_batch
             current_batch_label = self.current_batch_label
+            active_start = self.active_batch_start
+            active_end = self.active_batch_end
             status = self.status
             stop_requested = self.stop_requested
+            done_flash_until = dict(self._done_flash_until)
             avg_batch_seconds = (
                 sum(self._batch_durations) / len(self._batch_durations)
                 if self._batch_durations
@@ -289,59 +323,50 @@ class DefragProgressView:
 
         elapsed = time.time() - self._start_time
         eta = avg_batch_seconds * max(0, self.total_batches - completed_batches)
+        now_ts = time.time()
 
-        optimized_cells = min(self._used_cells, int(self._used_cells * ratio))
-        fragmented_cells = max(0, self._used_cells - optimized_cells)
-        fragmentation_ratio = (fragmented_cells / self._used_cells) * 100.0
+        total_blocks = sum(self._batch_block_counts)
+        completed_blocks = sum(self._batch_block_counts[:completed_batches])
 
-        cells = ["." for _ in range(self._map_cells)]
-        for idx in self._fragmented_layout[optimized_cells:]:
-            cells[idx] = "x"
-        for idx in range(optimized_cells):
-            cells[idx] = "#"
-
-        move_label = "idle"
-        if current_batch > 0 and optimized_cells < self._used_cells:
-            src = self._fragmented_layout[optimized_cells]
-            dst = optimized_cells
-            cells[src] = "*"
-            cells[dst] = "*"
-            move_label = f"moving cluster {src:04d} -> {dst:04d}"
-            step = -1 if src > dst else 1
-            trail = min(14, abs(src - dst))
-            pos = src
-            for _ in range(trail):
-                pos += step
-                if 0 <= pos < self._map_cells and cells[pos] == ".":
-                    cells[pos] = "-"
-
-        scan_col = (self._tick * 2) % self.MAP_COLS
-        for row in range(self.MAP_ROWS):
-            scan_idx = row * self.MAP_COLS + scan_col
-            if cells[scan_idx] == ".":
-                cells[scan_idx] = "|"
-            elif cells[scan_idx] == "x":
-                cells[scan_idx] = "X"
-
-        grid: list[str] = []
-        for row in range(self.MAP_ROWS):
-            raw = "".join(cells[row * self.MAP_COLS : (row + 1) * self.MAP_COLS])
-            grouped = " ".join(raw[idx : idx + 8] for idx in range(0, len(raw), 8))
-            grid.append(grouped)
+        lines: list[str] = []
+        line_parts: list[str] = []
+        visible_len = 0
+        separator = f"{self.COLOR_DIM}|{self.COLOR_RESET}"
+        for batch_number, block_count in enumerate(self._batch_block_counts, start=1):
+            color = self._batch_color(
+                batch_number=batch_number,
+                completed_batches=completed_batches,
+                active_start=active_start,
+                active_end=active_end,
+                now_ts=now_ts,
+                done_flash_until=done_flash_until,
+            )
+            token = f"{color}{'#' * block_count}{self.COLOR_RESET}{separator}"
+            token_visible = block_count + 1
+            if visible_len + token_visible > self.BLOCKS_PER_ROW and line_parts:
+                lines.append("".join(line_parts))
+                line_parts = []
+                visible_len = 0
+            line_parts.append(token)
+            visible_len += token_visible
+        if line_parts:
+            lines.append("".join(line_parts))
+        if not lines:
+            lines.append("(no blocks)")
 
         header = [
             "Qwen3-TTS Audiobook Defrag Progress",
             f"[{bar}] {percent:6.2f}%  batches {completed_batches}/{self.total_batches}  chars {completed_chars}/{self.total_chars}",
             f"elapsed {format_duration(elapsed)}  eta {format_duration(eta)}  current {current_batch_label}",
-            f"fragmentation: {fragmentation_ratio:5.1f}%  packed: {optimized_cells}/{self._used_cells}  {move_label}",
+            f"blocks: {completed_blocks}/{total_blocks}  (1 block = {self.CHARS_PER_BLOCK} chars)",
             f"status: {status}",
-            "legend: # packed  x fragmented  * moving  - path  | scanline  . free",
+            "legend: red=pending  blue=working  green=done-now  white=completed",
             "stop: requested (will exit after current inference call)"
             if stop_requested
             else "stop: running (press Ctrl+C once for graceful stop)",
             "",
         ]
-        return "\n".join(header + grid)
+        return "\n".join(header + lines)
 
 
 def load_state(state_path: Path) -> dict[str, Any]:
@@ -396,6 +421,8 @@ def create_continue_assets(
         str(runtime_options["pause_ms"]),
         "--inference-batch-size",
         str(runtime_options["inference_batch_size"]),
+        "--max-inference-chars",
+        str(runtime_options["max_inference_chars"]),
         "--language",
         str(runtime_options["language"]),
         "--model-id",
@@ -656,6 +683,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-inference-chars",
+        type=int,
+        default=DEFAULT_MAX_INFERENCE_CHARS,
+        help=(
+            "Upper limit of total characters per model call when using "
+            "--inference-batch-size > 1."
+        ),
+    )
+    parser.add_argument(
         "--language",
         type=str,
         default="Auto",
@@ -714,6 +750,9 @@ def main() -> int:
         return 2
     if args.inference_batch_size < 1:
         print("ERROR: --inference-batch-size must be at least 1.", file=sys.stderr)
+        return 2
+    if args.max_inference_chars < 200:
+        print("ERROR: --max-inference-chars must be at least 200.", file=sys.stderr)
         return 2
 
     is_resume = args.resume_state is not None
@@ -795,6 +834,13 @@ def main() -> int:
         and state.get("inference_batch_size")
         else args.inference_batch_size
     )
+    max_inference_chars = (
+        int(state["max_inference_chars"])
+        if is_resume
+        and args.max_inference_chars == DEFAULT_MAX_INFERENCE_CHARS
+        and state.get("max_inference_chars")
+        else args.max_inference_chars
+    )
     language = (
         str(state["language"])
         if is_resume and args.language == "Auto" and state.get("language")
@@ -850,6 +896,23 @@ def main() -> int:
     existing_chars = int(state.get("completed_characters", 0))
     total_batches = existing_batches + len(batches)
     total_chars = existing_chars + sum(batch.char_count for batch in batches)
+    fallback_batch_chars = max(1, existing_chars // max(1, existing_batches)) if existing_batches else max_chars
+    raw_saved_batch_chars = state.get("batch_char_counts", [])
+    saved_batch_chars: list[int] = []
+    if isinstance(raw_saved_batch_chars, list):
+        for value in raw_saved_batch_chars[:existing_batches]:
+            try:
+                saved_batch_chars.append(max(1, int(value)))
+            except (TypeError, ValueError):
+                saved_batch_chars.append(fallback_batch_chars)
+    if len(saved_batch_chars) < existing_batches:
+        saved_batch_chars.extend([fallback_batch_chars] * (existing_batches - len(saved_batch_chars)))
+    if len(saved_batch_chars) > existing_batches:
+        saved_batch_chars = saved_batch_chars[:existing_batches]
+
+    new_batch_chars = [batch.char_count for batch in batches]
+    all_batch_chars_for_view = saved_batch_chars + new_batch_chars
+    state_batch_chars = list(saved_batch_chars)
 
     progress = DefragProgressView(
         total_batches=total_batches,
@@ -857,6 +920,7 @@ def main() -> int:
         completed_batches=existing_batches,
         completed_chars=existing_chars,
         enabled=not args.no_defrag_ui,
+        batch_char_counts=all_batch_chars_for_view,
     )
     progress.start()
 
@@ -936,7 +1000,9 @@ def main() -> int:
                 "max_chars_per_batch": max_chars,
                 "pause_ms": pause_ms,
                 "inference_batch_size": inference_batch_size,
+                "max_inference_chars": max_inference_chars,
                 "part_files": part_files,
+                "batch_char_counts": state_batch_chars,
                 "completed_batches": existing_batches,
                 "completed_characters": existing_chars,
                 "stopped_early": False,
@@ -956,6 +1022,7 @@ def main() -> int:
             "max_chars_per_batch": max_chars,
             "pause_ms": pause_ms,
             "inference_batch_size": inference_batch_size,
+            "max_inference_chars": max_inference_chars,
             "language": language,
             "model_id": model_id,
             "device": device,
@@ -976,7 +1043,20 @@ def main() -> int:
                 progress.mark_stop_requested()
                 effective_inference_batch_size = 1
 
-            group = batches[local_index : local_index + effective_inference_batch_size]
+            group_cap_chars = max(200, max_inference_chars)
+            selected_count = 0
+            selected_chars = 0
+            for candidate in batches[
+                local_index : local_index + effective_inference_batch_size
+            ]:
+                next_chars = selected_chars + candidate.char_count
+                if selected_count > 0 and next_chars > group_cap_chars:
+                    break
+                selected_count += 1
+                selected_chars = next_chars
+            if selected_count <= 0:
+                selected_count = 1
+            group = batches[local_index : local_index + selected_count]
             global_first = existing_batches + completed_this_run + 1
             global_last = global_first + len(group) - 1
             group_chars = sum(item.char_count for item in group)
@@ -993,20 +1073,72 @@ def main() -> int:
                 group_chars,
                 f"Generating {batch_label}...",
                 batch_label=batch_label,
+                active_batch_count=len(group),
             )
             if args.no_defrag_ui:
                 print(f"{batch_label}: generating...")
 
             started = time.time()
+            text_payload: str | list[str]
+            if len(group) == 1:
+                text_payload = group[0].text
+            else:
+                text_payload = [item.text for item in group]
             kwargs: dict[str, Any] = {
-                "text": [item.text for item in group] if len(group) > 1 else group[0].text,
+                "text": text_payload,
                 "voice_clone_prompt": clone_prompt,
             }
             if language.lower() != "auto":
-                kwargs["language"] = (
-                    [language for _ in group] if len(group) > 1 else language
+                kwargs["language"] = language
+            try:
+                wavs, sample_rate = model.generate_voice_clone(**kwargs)
+            except Exception as gen_exc:
+                gen_error = str(gen_exc)
+                gen_error_lower = gen_error.lower()
+                is_cuda_assert = (
+                    "device-side assert triggered" in gen_error_lower
+                    or "cudaerrorassert" in gen_error_lower
                 )
-            wavs, sample_rate = model.generate_voice_clone(**kwargs)
+                if len(group) > 1 and is_cuda_assert:
+                    raise RuntimeError(
+                        "CUDA device-side assert triggered during batched inference. "
+                        "Restart this process and retry with smaller settings, "
+                        "for example --inference-batch-size 1 or a lower --max-inference-chars."
+                    ) from gen_exc
+                if len(group) > 1:
+                    progress.set_status(
+                        "Batched call failed; retrying batches one-by-one."
+                    )
+                    if args.no_defrag_ui:
+                        print(
+                            "WARNING: Batched call failed; retrying one-by-one. "
+                            f"Reason: {gen_error}"
+                        )
+                    wavs = []
+                    sample_rate = None
+                    for single in group:
+                        single_kwargs: dict[str, Any] = {
+                            "text": single.text,
+                            "voice_clone_prompt": clone_prompt,
+                        }
+                        if language.lower() != "auto":
+                            single_kwargs["language"] = language
+                        single_wavs, single_rate = model.generate_voice_clone(
+                            **single_kwargs
+                        )
+                        if not single_wavs:
+                            raise RuntimeError(
+                                "Empty audio output while retrying single-batch generation."
+                            )
+                        if sample_rate is None:
+                            sample_rate = int(single_rate)
+                        elif int(single_rate) != int(sample_rate):
+                            raise RuntimeError(
+                                "Sample-rate mismatch across sequential fallback outputs."
+                            )
+                        wavs.append(single_wavs[0])
+                else:
+                    raise
             if not wavs:
                 raise RuntimeError(f"Empty audio output for {batch_label}.")
             if len(wavs) != len(group):
@@ -1024,6 +1156,7 @@ def main() -> int:
 
                 completed_this_run += 1
                 completed_chars_total += batch.char_count
+                state_batch_chars.append(batch.char_count)
                 progress.mark_batch_complete(batch.char_count, per_batch_duration)
                 if args.no_defrag_ui:
                     print(
@@ -1032,6 +1165,7 @@ def main() -> int:
                     )
 
                 state["part_files"] = part_files
+                state["batch_char_counts"] = state_batch_chars
                 state["completed_batches"] = len(part_files)
                 state["completed_characters"] = completed_chars_total
                 state["sample_rate"] = int(sample_rate)
@@ -1104,6 +1238,11 @@ def main() -> int:
         return 0
     except Exception as exc:
         error_text = str(exc)
+        if "device-side assert triggered" in error_text.lower():
+            error_text += (
+                " | CUDA context is now invalid for this process. Restart and retry with "
+                "--inference-batch-size 1 or a lower --max-inference-chars."
+            )
         if "no kernel image is available for execution on the device" in error_text:
             error_text += (
                 " | likely GPU/torch CUDA architecture mismatch. "

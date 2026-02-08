@@ -23,15 +23,28 @@ mkdir -p "${PIP_CACHE_DIR}" "${TMPDIR}"
 
 echo "[1/6] Installing base system packages..."
 if command -v apt-get >/dev/null 2>&1; then
-  sudo apt-get update
-  sudo apt-get install -y \
-    python3 \
-    python3-venv \
-    python3-pip \
-    ffmpeg \
-    git \
-    build-essential \
-    libsndfile1
+  APT_PREFIX=()
+  APT_SKIP="0"
+  if [[ "$(id -u)" -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      APT_PREFIX=(sudo)
+    else
+      echo "apt-get is available, but this shell is not root and sudo is missing."
+      echo "Skipping system package install step."
+      APT_SKIP="1"
+    fi
+  fi
+  if [[ "${APT_SKIP}" == "0" ]]; then
+    "${APT_PREFIX[@]}" apt-get update
+    "${APT_PREFIX[@]}" apt-get install -y \
+      python3 \
+      python3-venv \
+      python3-pip \
+      ffmpeg \
+      git \
+      build-essential \
+      libsndfile1
+  fi
 else
   echo "apt-get not found."
   echo "Install manually: python3 python3-venv python3-pip ffmpeg build-essential libsndfile1"

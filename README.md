@@ -9,7 +9,11 @@ Simple CLI app that turns a `.txt` file into an audiobook with Qwen3-TTS voice c
 - Combines short paragraphs until `--max-chars-per-batch` is reached.
 - Batch boundaries only happen between paragraphs.
 - Combines all generated parts into one final WAV with a configurable pause between batches.
-- Defrag-style live progress UI in terminal with clustered disk map and scanline.
+- Defrag-style live progress UI where each batch uses one block per 200 chars:
+  - red: pending
+  - blue: currently processing
+  - green: just completed
+  - white: completed
 - Graceful stop: press `Ctrl+C` once, current inference call finishes, then app exits.
 - Auto-generated resume assets on early stop:
   - new `.txt` with remaining text
@@ -55,6 +59,7 @@ python audiobook_qwen3.py \
 - `--max-chars-per-batch`: batch size control in characters.
 - `--pause-ms`: silence inserted between batch outputs.
 - `--inference-batch-size`: number of text batches generated per model call.
+- `--max-inference-chars`: max total characters per model call in batched mode.
 - `--output`: final combined WAV file.
 - `--resume-state`: continue from an existing `session_state.json`.
 - `--attn-implementation`: attention backend (`sdpa` default, `flash_attention_2` optional).
@@ -87,6 +92,7 @@ Run the generated continue script to finish remaining text.
 
 If you see:
 - `CUDA error: no kernel image is available for execution on the device`
+- `CUDA error: device-side assert triggered`
 
 Then your GPU architecture is likely not supported by the currently installed PyTorch CUDA wheel.
 
@@ -111,7 +117,8 @@ python -m pip install --upgrade torch torchvision torchaudio --index-url https:/
 And run with safe settings:
 
 ```bash
-python audiobook_qwen3.py ... --dtype float16 --attn-implementation sdpa --inference-batch-size 2
+python audiobook_qwen3.py ... --dtype float16 --attn-implementation sdpa --inference-batch-size 2 --max-inference-chars 2200
 ```
 
 If GPU usage is low, increase `--inference-batch-size` gradually (for example `2`, `4`, then `6`) while watching VRAM.
+If batched inference causes CUDA asserts, reduce `--inference-batch-size` and/or `--max-inference-chars`.
