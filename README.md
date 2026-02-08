@@ -9,8 +9,8 @@ Simple CLI app that turns a `.txt` file into an audiobook with Qwen3-TTS voice c
 - Combines short paragraphs until `--max-chars-per-batch` is reached.
 - Batch boundaries only happen between paragraphs.
 - Combines all generated parts into one final WAV with a configurable pause between batches.
-- Defrag-style live progress UI in terminal.
-- Graceful stop: press `Ctrl+C` once, current batch finishes, then app exits.
+- Defrag-style live progress UI in terminal with clustered disk map and scanline.
+- Graceful stop: press `Ctrl+C` once, current inference call finishes, then app exits.
 - Auto-generated resume assets on early stop:
   - new `.txt` with remaining text
   - `continue_*.sh`
@@ -54,6 +54,7 @@ python audiobook_qwen3.py \
 - `--x-vector-only-mode`: allow cloning without transcript.
 - `--max-chars-per-batch`: batch size control in characters.
 - `--pause-ms`: silence inserted between batch outputs.
+- `--inference-batch-size`: number of text batches generated per model call.
 - `--output`: final combined WAV file.
 - `--resume-state`: continue from an existing `session_state.json`.
 - `--attn-implementation`: attention backend (`sdpa` default, `flash_attention_2` optional).
@@ -65,7 +66,7 @@ python audiobook_qwen3.py \
 Press `Ctrl+C` once while running.
 
 Behavior:
-1. Current batch finishes.
+1. Current inference call finishes.
 2. Existing parts are still combined into current output WAV.
 3. The app writes:
    - `continue_from_batch_XXXXX.txt`
@@ -110,5 +111,7 @@ python -m pip install --upgrade torch torchvision torchaudio --index-url https:/
 And run with safe settings:
 
 ```bash
-python audiobook_qwen3.py ... --dtype float16 --attn-implementation sdpa
+python audiobook_qwen3.py ... --dtype float16 --attn-implementation sdpa --inference-batch-size 2
 ```
+
+If GPU usage is low, increase `--inference-batch-size` gradually (for example `2`, `4`, then `6`) while watching VRAM.

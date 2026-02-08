@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import random
 import re
 import shlex
 import signal
@@ -152,6 +153,9 @@ class StopController:
 
 
 class DefragProgressView:
+    MAP_COLS = 72
+    MAP_ROWS = 10
+
     def __init__(
         self,
         total_batches: int,
@@ -167,6 +171,7 @@ class DefragProgressView:
         self.enabled = enabled and sys.stdout.isatty()
         self.current_batch = 0
         self.current_batch_chars = 0
+        self.current_batch_label = "idle"
         self.stop_requested = False
         self.status = "Loading model..."
         self._batch_durations: list[float] = []
@@ -175,6 +180,10 @@ class DefragProgressView:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._map_cells = self.MAP_COLS * self.MAP_ROWS
+        used_ratio = 0.60 + (self.total_chars / (self.total_chars + 18000.0)) * 0.22
+        self._used_cells = max(1, min(self._map_cells, int(self._map_cells * used_ratio)))
+        self._fragmented_layout = self._build_fragmented_layout()
 
     def start(self) -> None:
         if not self.enabled:
@@ -186,10 +195,21 @@ class DefragProgressView:
         with self._lock:
             self.status = message
 
-    def set_active_batch(self, batch_number: int, batch_chars: int, message: str) -> None:
+    def set_active_batch(
+        self,
+        batch_number: int,
+        batch_chars: int,
+        message: str,
+        batch_label: str | None = None,
+    ) -> None:
         with self._lock:
             self.current_batch = batch_number
             self.current_batch_chars = batch_chars
+            self.current_batch_label = (
+                batch_label
+                if batch_label
+                else f"batch {batch_number}/{self.total_batches} ({batch_chars} chars)"
+            )
             self.status = message
 
     def mark_batch_complete(self, batch_chars: int, duration_seconds: float) -> None:
@@ -198,6 +218,7 @@ class DefragProgressView:
             self.completed_chars += batch_chars
             self.current_batch = 0
             self.current_batch_chars = 0
+            self.current_batch_label = "idle"
             self._batch_durations.append(duration_seconds)
             if len(self._batch_durations) > 12:
                 self._batch_durations.pop(0)
@@ -206,7 +227,7 @@ class DefragProgressView:
     def mark_stop_requested(self) -> None:
         with self._lock:
             self.stop_requested = True
-            self.status = "Stop requested; finishing current batch."
+            self.status = "Stop requested; finishing current inference call."
 
     def stop(self, final_status: str | None = None) -> None:
         if final_status:
@@ -236,12 +257,22 @@ class DefragProgressView:
             sys.stdout.write("\n")
         sys.stdout.flush()
 
+    def _build_fragmented_layout(self) -> list[int]:
+        seed = self.total_chars + self.total_batches * 113 + self.completed_batches * 17
+        rng = random.Random(seed)
+        reserve_left = max(8, self._map_cells // 9)
+        candidates = list(range(reserve_left, self._map_cells))
+        if self._used_cells > len(candidates):
+            return list(range(self._used_cells))
+        picked = sorted(rng.sample(candidates, self._used_cells))
+        return picked
+
     def _build_frame(self) -> str:
         with self._lock:
             completed_batches = self.completed_batches
             completed_chars = self.completed_chars
             current_batch = self.current_batch
-            current_batch_chars = self.current_batch_chars
+            current_batch_label = self.current_batch_label
             status = self.status
             stop_requested = self.stop_requested
             avg_batch_seconds = (
@@ -259,38 +290,53 @@ class DefragProgressView:
         elapsed = time.time() - self._start_time
         eta = avg_batch_seconds * max(0, self.total_batches - completed_batches)
 
-        cols = 60
-        rows = 8
-        total_cells = cols * rows
-        done_cells = int(total_cells * ratio)
-        cells = ["." for _ in range(total_cells)]
-        for idx in range(done_cells):
+        optimized_cells = min(self._used_cells, int(self._used_cells * ratio))
+        fragmented_cells = max(0, self._used_cells - optimized_cells)
+        fragmentation_ratio = (fragmented_cells / self._used_cells) * 100.0
+
+        cells = ["." for _ in range(self._map_cells)]
+        for idx in self._fragmented_layout[optimized_cells:]:
+            cells[idx] = "x"
+        for idx in range(optimized_cells):
             cells[idx] = "#"
 
-        if current_batch > 0 and done_cells < total_cells:
-            remain = total_cells - done_cells
-            span = min(max(4, remain // 10), remain)
-            start = done_cells + (self._tick * 3) % max(1, remain)
-            for offset in range(span):
-                pos = done_cells + ((start - done_cells + offset) % remain)
-                cells[pos] = "+"
+        move_label = "idle"
+        if current_batch > 0 and optimized_cells < self._used_cells:
+            src = self._fragmented_layout[optimized_cells]
+            dst = optimized_cells
+            cells[src] = "*"
+            cells[dst] = "*"
+            move_label = f"moving cluster {src:04d} -> {dst:04d}"
+            step = -1 if src > dst else 1
+            trail = min(14, abs(src - dst))
+            pos = src
+            for _ in range(trail):
+                pos += step
+                if 0 <= pos < self._map_cells and cells[pos] == ".":
+                    cells[pos] = "-"
 
-        head = (self._tick * 5) % total_cells
-        cells[head] = "@"
-        grid = ["".join(cells[row * cols : (row + 1) * cols]) for row in range(rows)]
+        scan_col = (self._tick * 2) % self.MAP_COLS
+        for row in range(self.MAP_ROWS):
+            scan_idx = row * self.MAP_COLS + scan_col
+            if cells[scan_idx] == ".":
+                cells[scan_idx] = "|"
+            elif cells[scan_idx] == "x":
+                cells[scan_idx] = "X"
 
-        current_label = (
-            f"batch {current_batch}/{self.total_batches} ({current_batch_chars} chars)"
-            if current_batch
-            else "idle"
-        )
+        grid: list[str] = []
+        for row in range(self.MAP_ROWS):
+            raw = "".join(cells[row * self.MAP_COLS : (row + 1) * self.MAP_COLS])
+            grouped = " ".join(raw[idx : idx + 8] for idx in range(0, len(raw), 8))
+            grid.append(grouped)
+
         header = [
             "Qwen3-TTS Audiobook Defrag Progress",
             f"[{bar}] {percent:6.2f}%  batches {completed_batches}/{self.total_batches}  chars {completed_chars}/{self.total_chars}",
-            f"elapsed {format_duration(elapsed)}  eta {format_duration(eta)}  current {current_label}",
+            f"elapsed {format_duration(elapsed)}  eta {format_duration(eta)}  current {current_batch_label}",
+            f"fragmentation: {fragmentation_ratio:5.1f}%  packed: {optimized_cells}/{self._used_cells}  {move_label}",
             f"status: {status}",
-            "legend: @ head  + active  # done  . queued",
-            "stop: requested (will exit after current batch)"
+            "legend: # packed  x fragmented  * moving  - path  | scanline  . free",
+            "stop: requested (will exit after current inference call)"
             if stop_requested
             else "stop: running (press Ctrl+C once for graceful stop)",
             "",
@@ -348,6 +394,8 @@ def create_continue_assets(
         str(runtime_options["max_chars_per_batch"]),
         "--pause-ms",
         str(runtime_options["pause_ms"]),
+        "--inference-batch-size",
+        str(runtime_options["inference_batch_size"]),
         "--language",
         str(runtime_options["language"]),
         "--model-id",
@@ -599,6 +647,15 @@ def parse_args() -> argparse.Namespace:
         help=f"Pause between batch chunks in milliseconds (default: {DEFAULT_PAUSE_MS}).",
     )
     parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "How many text batches to generate per model call. "
+            "Higher values can improve GPU utilization but use more VRAM."
+        ),
+    )
+    parser.add_argument(
         "--language",
         type=str,
         default="Auto",
@@ -654,6 +711,9 @@ def main() -> int:
         return 2
     if args.pause_ms < 0:
         print("ERROR: --pause-ms cannot be negative.", file=sys.stderr)
+        return 2
+    if args.inference_batch_size < 1:
+        print("ERROR: --inference-batch-size must be at least 1.", file=sys.stderr)
         return 2
 
     is_resume = args.resume_state is not None
@@ -727,6 +787,13 @@ def main() -> int:
         int(state["pause_ms"])
         if is_resume and args.pause_ms == DEFAULT_PAUSE_MS and state.get("pause_ms")
         else args.pause_ms
+    )
+    inference_batch_size = (
+        int(state["inference_batch_size"])
+        if is_resume
+        and args.inference_batch_size == 1
+        and state.get("inference_batch_size")
+        else args.inference_batch_size
     )
     language = (
         str(state["language"])
@@ -868,6 +935,7 @@ def main() -> int:
                 "language": language,
                 "max_chars_per_batch": max_chars,
                 "pause_ms": pause_ms,
+                "inference_batch_size": inference_batch_size,
                 "part_files": part_files,
                 "completed_batches": existing_batches,
                 "completed_characters": existing_chars,
@@ -887,6 +955,7 @@ def main() -> int:
             "output_wav": output_wav,
             "max_chars_per_batch": max_chars,
             "pause_ms": pause_ms,
+            "inference_batch_size": inference_batch_size,
             "language": language,
             "model_id": model_id,
             "device": device,
@@ -897,52 +966,82 @@ def main() -> int:
         }
         script_path = Path(__file__).resolve()
 
-        for local_index, batch in enumerate(batches, start=1):
+        local_index = 0
+        while local_index < len(batches):
             if stop_controller.force_stop:
                 break
 
-            global_batch = existing_batches + completed_this_run + 1
+            effective_inference_batch_size = max(1, inference_batch_size)
+            if stop_controller.stop_requested:
+                progress.mark_stop_requested()
+                effective_inference_batch_size = 1
+
+            group = batches[local_index : local_index + effective_inference_batch_size]
+            global_first = existing_batches + completed_this_run + 1
+            global_last = global_first + len(group) - 1
+            group_chars = sum(item.char_count for item in group)
+            if len(group) == 1:
+                batch_label = f"batch {global_first}/{total_batches} ({group_chars} chars)"
+            else:
+                batch_label = (
+                    f"batches {global_first}-{global_last}/{total_batches} "
+                    f"({group_chars} chars total)"
+                )
+
             progress.set_active_batch(
-                global_batch,
-                batch.char_count,
-                f"Generating batch {global_batch}/{total_batches}...",
+                global_first,
+                group_chars,
+                f"Generating {batch_label}...",
+                batch_label=batch_label,
             )
             if args.no_defrag_ui:
-                print(
-                    f"Batch {global_batch}/{total_batches} ({batch.char_count} chars): generating..."
-                )
+                print(f"{batch_label}: generating...")
 
             started = time.time()
             kwargs: dict[str, Any] = {
-                "text": batch.text,
+                "text": [item.text for item in group] if len(group) > 1 else group[0].text,
                 "voice_clone_prompt": clone_prompt,
             }
             if language.lower() != "auto":
-                kwargs["language"] = language
+                kwargs["language"] = (
+                    [language for _ in group] if len(group) > 1 else language
+                )
             wavs, sample_rate = model.generate_voice_clone(**kwargs)
             if not wavs:
-                raise RuntimeError(f"Empty audio output for batch {global_batch}.")
+                raise RuntimeError(f"Empty audio output for {batch_label}.")
+            if len(wavs) != len(group):
+                raise RuntimeError(
+                    f"Model returned {len(wavs)} clips for {len(group)} batches in {batch_label}."
+                )
 
-            part_path = parts_dir / f"batch_{global_batch:05d}.wav"
-            sf.write(str(part_path), wavs[0], sample_rate)
-            part_files.append(str(part_path.relative_to(run_dir).as_posix()))
+            call_duration = time.time() - started
+            per_batch_duration = call_duration / max(1, len(group))
+            for offset, batch in enumerate(group):
+                global_batch = global_first + offset
+                part_path = parts_dir / f"batch_{global_batch:05d}.wav"
+                sf.write(str(part_path), wavs[offset], sample_rate)
+                part_files.append(str(part_path.relative_to(run_dir).as_posix()))
 
-            duration = time.time() - started
-            completed_this_run += 1
-            completed_chars_total += batch.char_count
-            progress.mark_batch_complete(batch.char_count, duration)
-            if args.no_defrag_ui:
-                print(f"Batch {global_batch}: complete in {duration:.1f}s")
+                completed_this_run += 1
+                completed_chars_total += batch.char_count
+                progress.mark_batch_complete(batch.char_count, per_batch_duration)
+                if args.no_defrag_ui:
+                    print(
+                        f"Batch {global_batch}: complete "
+                        f"(group call {call_duration:.1f}s, per-batch {per_batch_duration:.1f}s)"
+                    )
 
-            state["part_files"] = part_files
-            state["completed_batches"] = len(part_files)
-            state["completed_characters"] = completed_chars_total
-            state["sample_rate"] = int(sample_rate)
-            state["updated_at"] = now_iso()
-            save_state(state_path, state)
+                state["part_files"] = part_files
+                state["completed_batches"] = len(part_files)
+                state["completed_characters"] = completed_chars_total
+                state["sample_rate"] = int(sample_rate)
+                state["updated_at"] = now_iso()
+                save_state(state_path, state)
 
-            if args.stop_after_batch > 0 and local_index >= args.stop_after_batch:
-                stop_controller.request_stop()
+                if args.stop_after_batch > 0 and completed_this_run >= args.stop_after_batch:
+                    stop_controller.request_stop()
+
+            local_index += len(group)
             if stop_controller.stop_requested:
                 progress.mark_stop_requested()
                 break
@@ -978,7 +1077,7 @@ def main() -> int:
             )
             save_state(state_path, state)
             progress.stop("Stopped early. Continue assets were generated.")
-            print("Stopped early after current batch.")
+            print("Stopped early after current inference call.")
             print(f"Audio: {output_wav}")
             print(f"State: {state_path}")
             print(f"Remaining text: {assets['remaining_text_file']}")
