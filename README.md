@@ -62,7 +62,7 @@ python audiobook_qwen3.py \
 - `--max-inference-chars`: compatibility option retained for old scripts; ignored.
 - `--output`: final combined WAV file.
 - `--resume-state`: continue from an existing `session_state.json`.
-- `--attn-implementation`: attention backend (`sdpa` default, `flash_attention_2` optional).
+- `--attn-implementation`: attention backend (`eager` default, `flash_attention_2` optional).
 - `--dtype`: model precision (`float16` default for broad GPU compatibility).
 - `--no-defrag-ui`: fallback to plain logs.
 
@@ -84,7 +84,7 @@ Run the generated continue script to finish remaining text.
 ## Notes
 
 - Default model is `Qwen/Qwen3-TTS-12Hz-0.6B-Base`.
-- Default attention is `sdpa` for reliability. If `flash-attn` is installed, you can use `--attn-implementation flash_attention_2`.
+- Default attention is `eager` for maximum CUDA stability. If `flash-attn` is installed, you can use `--attn-implementation flash_attention_2`.
 - This project follows Qwen3-TTS API patterns from the official repository:
   - https://github.com/QwenLM/Qwen3-TTS
 
@@ -120,7 +120,15 @@ That can still work through same-major forward compatibility.
 And run with safe settings:
 
 ```bash
-python audiobook_qwen3.py ... --dtype float16 --attn-implementation sdpa
+python audiobook_qwen3.py ... --dtype float16 --attn-implementation eager
 ```
 
 Batched inference was removed for stability after repeated CUDA assert failures on some GPU setups.
+
+If CUDA asserts still happen:
+
+```bash
+python audiobook_qwen3.py ... --device cpu --dtype float32 --attn-implementation eager
+```
+
+If CPU works but CUDA fails, the issue is in the CUDA stack (torch/cuda/driver image), not your text batching.

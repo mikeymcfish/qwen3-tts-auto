@@ -25,7 +25,7 @@ DEFAULT_OUTPUT_NAME = "audiobook.wav"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_PAUSE_MS = 300
 DEFAULT_MAX_INFERENCE_CHARS = 2600
-DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
+DEFAULT_ATTN_IMPLEMENTATION = "eager"
 DEFAULT_DTYPE = "float16"
 
 
@@ -508,8 +508,8 @@ def choose_attention_implementation(requested: str) -> tuple[str, str | None]:
     if has_flash_attn:
         return requested, None
     return (
-        "sdpa",
-        "flash-attn is not installed; falling back from flash_attention_2 to sdpa.",
+        "eager",
+        "flash-attn is not installed; falling back from flash_attention_2 to eager.",
     )
 
 
@@ -1004,15 +1004,15 @@ def main() -> int:
                 attn_implementation=attn,
             )
         except Exception as model_exc:
-            if attn != "sdpa":
+            if attn != "eager":
                 fallback_msg = (
-                    f"Model load failed with attn '{attn}', retrying with 'sdpa'. "
+                    f"Model load failed with attn '{attn}', retrying with 'eager'. "
                     f"Reason: {model_exc}"
                 )
                 progress.set_status(fallback_msg)
                 if args.no_defrag_ui:
                     print(f"WARNING: {fallback_msg}")
-                attn = "sdpa"
+                attn = "eager"
                 model = Qwen3TTSModel.from_pretrained(
                     model_id,
                     device_map=device,
@@ -1204,7 +1204,7 @@ def main() -> int:
             error_text += (
                 " | likely GPU/torch CUDA architecture mismatch. "
                 "Try: (1) reinstall newer torch CUDA wheels (e.g. cu128 on RunPod), "
-                "(2) use --dtype float16, (3) use --attn-implementation sdpa."
+                "(2) use --dtype float16, (3) use --attn-implementation eager."
             )
         progress.stop(f"Failed: {exc}")
         print(f"ERROR: {error_text}", file=sys.stderr)
