@@ -1,4 +1,7 @@
-python audiobook_qwen3.py --text-file TEST.txt --reference-audio griffin_3s.wav --reference-text-file griffin_3s.txt
-
-notes:
-python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+python audiobook_qwen3.py \
+  --text-file TEST.txt \
+  --reference-audio griffin_3s.wav \
+  --reference-text-file griffin_3s.txt \
+  --dtype bfloat16 \
+  --attn-implementation flash_attention_2 \
+  --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base

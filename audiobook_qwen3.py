@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Create audiobook WAV files from text using Qwen3-TTS voice cloning.
+Create audiobook files from text using Qwen3-TTS voice cloning.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib.util
 import json
 import re
+import shutil
 import shlex
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -20,8 +23,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 APP_VERSION = "0.1.0"
-DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-DEFAULT_OUTPUT_NAME = "audiobook.wav"
+DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+DEFAULT_OUTPUT_NAME = "audiobook.mp3"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_PAUSE_MS = 300
 DEFAULT_MAX_INFERENCE_CHARS = 2600
@@ -124,6 +127,7 @@ class StopController:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._stop_requested = False
+        self._abort_current_batch = False
         self._force_stop = False
 
     @property
@@ -136,15 +140,27 @@ class StopController:
         with self._lock:
             return self._force_stop
 
+    @property
+    def abort_current_batch(self) -> bool:
+        with self._lock:
+            return self._abort_current_batch
+
     def request_stop(self) -> None:
         with self._lock:
             self._stop_requested = True
+
+    def request_abort_current_batch(self) -> None:
+        with self._lock:
+            self._stop_requested = True
+            self._abort_current_batch = True
 
     def install(self) -> None:
         def handler(_signum: int, _frame: Any) -> None:
             with self._lock:
                 if not self._stop_requested:
                     self._stop_requested = True
+                elif not self._abort_current_batch:
+                    self._abort_current_batch = True
                 else:
                     self._force_stop = True
 
@@ -156,11 +172,15 @@ class DefragProgressView:
     CHARS_PER_BLOCK = 200
     BLOCKS_PER_ROW = 120
     DONE_FLASH_SECONDS = 1.4
+    SPINNER_FRAMES = ["|", "/", "-", "\\"]
     COLOR_RESET = "\x1b[0m"
     COLOR_RED = "\x1b[91m"
     COLOR_BLUE = "\x1b[94m"
     COLOR_GREEN = "\x1b[92m"
     COLOR_WHITE = "\x1b[97m"
+    COLOR_CYAN = "\x1b[96m"
+    COLOR_YELLOW = "\x1b[93m"
+    COLOR_MAGENTA = "\x1b[95m"
     COLOR_DIM = "\x1b[90m"
 
     def __init__(
@@ -252,7 +272,23 @@ class DefragProgressView:
     def mark_stop_requested(self) -> None:
         with self._lock:
             self.stop_requested = True
-            self.status = "Stop requested; finishing current inference call."
+            self.status = "Stop requested; finishing current batch."
+
+    def mark_abort_requested(self) -> None:
+        with self._lock:
+            self.stop_requested = True
+            self.status = "Abort requested; trying to cancel current batch."
+
+    def mark_batch_aborted(self, canceled: bool) -> None:
+        with self._lock:
+            self.current_batch = 0
+            self.current_batch_chars = 0
+            self.current_batch_label = "idle"
+            self.status = (
+                "Batch canceled before execution; leaving it for resume."
+                if canceled
+                else "Batch could not be interrupted in-flight; keeping it for resume."
+            )
 
     def stop(self, final_status: str | None = None) -> None:
         if final_status:
@@ -324,14 +360,19 @@ class DefragProgressView:
         elapsed = time.time() - self._start_time
         eta = avg_batch_seconds * max(0, self.total_batches - completed_batches)
         now_ts = time.time()
+        spinner = self.SPINNER_FRAMES[self._tick % len(self.SPINNER_FRAMES)]
 
         total_blocks = sum(self._batch_block_counts)
         completed_blocks = sum(self._batch_block_counts[:completed_batches])
+        throughput = completed_chars / elapsed if elapsed > 0 else 0.0
+        beam_index = (self._tick * 3) % max(1, total_blocks)
+        beat = self._tick % 4
 
         lines: list[str] = []
         line_parts: list[str] = []
         visible_len = 0
         separator = f"{self.COLOR_DIM}|{self.COLOR_RESET}"
+        block_cursor = 0
         for batch_number, block_count in enumerate(self._batch_block_counts, start=1):
             color = self._batch_color(
                 batch_number=batch_number,
@@ -341,7 +382,27 @@ class DefragProgressView:
                 now_ts=now_ts,
                 done_flash_until=done_flash_until,
             )
-            token = f"{color}{'#' * block_count}{self.COLOR_RESET}{separator}"
+            if active_start <= batch_number <= active_end:
+                active_char = [">", "=", "~", ">"][beat]
+                segment = [active_char for _ in range(block_count)]
+            else:
+                segment = ["#" for _ in range(block_count)]
+
+            if block_cursor <= beam_index < block_cursor + block_count:
+                beam_offset = beam_index - block_cursor
+                segment[beam_offset] = "*"
+
+            segment_text = "".join(segment)
+            if "*" in segment_text:
+                beam_offset = segment_text.index("*")
+                token = (
+                    f"{color}{segment_text[:beam_offset]}"
+                    f"{self.COLOR_CYAN}*{color}{segment_text[beam_offset + 1:]}"
+                    f"{self.COLOR_RESET}{separator}"
+                )
+            else:
+                token = f"{color}{segment_text}{self.COLOR_RESET}{separator}"
+
             token_visible = block_count + 1
             if visible_len + token_visible > self.BLOCKS_PER_ROW and line_parts:
                 lines.append("".join(line_parts))
@@ -349,21 +410,38 @@ class DefragProgressView:
                 visible_len = 0
             line_parts.append(token)
             visible_len += token_visible
+            block_cursor += block_count
         if line_parts:
             lines.append("".join(line_parts))
         if not lines:
             lines.append("(no blocks)")
 
+        scan_bar_len = 38
+        scan_pos = self._tick % scan_bar_len
+        scan_chars = ["."] * scan_bar_len
+        scan_chars[scan_pos] = ">"
+        if scan_pos + 1 < scan_bar_len:
+            scan_chars[scan_pos + 1] = ">"
+        scanline = (
+            f"{self.COLOR_DIM}{''.join(scan_chars[:max(0, scan_pos - 2)])}"
+            f"{self.COLOR_CYAN}{''.join(scan_chars[max(0, scan_pos - 2):scan_pos + 2])}"
+            f"{self.COLOR_DIM}{''.join(scan_chars[scan_pos + 2:])}{self.COLOR_RESET}"
+        )
+
         header = [
-            "Qwen3-TTS Audiobook Defrag Progress",
+            f"{self.COLOR_CYAN}=============================================================={self.COLOR_RESET}",
+            f"{self.COLOR_MAGENTA}{spinner}{self.COLOR_RESET} Qwen3-TTS Defrag Animator",
             f"[{bar}] {percent:6.2f}%  batches {completed_batches}/{self.total_batches}  chars {completed_chars}/{self.total_chars}",
-            f"elapsed {format_duration(elapsed)}  eta {format_duration(eta)}  current {current_batch_label}",
-            f"blocks: {completed_blocks}/{total_blocks}  (1 block = {self.CHARS_PER_BLOCK} chars)",
-            f"status: {status}",
-            "legend: red=pending  blue=working  green=done-now  white=completed",
-            "stop: requested (will exit after current inference call)"
+            f"elapsed {format_duration(elapsed)}  eta {format_duration(eta)}  throughput {throughput:7.1f} chars/s",
+            f"current {current_batch_label}",
+            f"blocks: {completed_blocks}/{total_blocks}  (1 block = {self.CHARS_PER_BLOCK} chars)  beam=*",
+            f"scanline {scanline}",
+            f"status: {self.COLOR_YELLOW}{status}{self.COLOR_RESET}",
+            "legend: red=pending  blue=working  green=done-now  white=completed  cyan=* scan",
+            "stop: requested (will exit after current batch)"
             if stop_requested
-            else "stop: running (press Ctrl+C once for graceful stop)",
+            else "stop: running (Ctrl+C once stop-after-batch, twice try abort-current)",
+            f"{self.COLOR_CYAN}=============================================================={self.COLOR_RESET}",
             "",
         ]
         return "\n".join(header + lines)
@@ -419,6 +497,8 @@ def create_continue_assets(
         str(runtime_options["max_chars_per_batch"]),
         "--pause-ms",
         str(runtime_options["pause_ms"]),
+        "--mp3-quality",
+        str(runtime_options["mp3_quality"]),
         "--inference-batch-size",
         str(runtime_options["inference_batch_size"]),
         "--max-inference-chars",
@@ -666,6 +746,37 @@ def combine_parts_with_pause(
     return int(sample_rate), float(duration_seconds)
 
 
+def convert_wav_to_mp3(input_wav: Path, output_mp3: Path, quality_level: int) -> None:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise RuntimeError(
+            "ffmpeg is required for MP3 output but was not found in PATH."
+        )
+    output_mp3.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_wav),
+        "-vn",
+        "-codec:a",
+        "libmp3lame",
+        "-q:a",
+        str(quality_level),
+        str(output_mp3),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(
+            "High-quality MP3 conversion failed via ffmpeg."
+            + (f" Detail: {detail}" if detail else "")
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create audiobooks from text using Qwen3-TTS voice cloning."
@@ -696,7 +807,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        help="Output audiobook WAV path. Default: <run_dir>/audiobook.wav",
+        help="Final output path (.mp3 recommended, .wav supported). Default: <run_dir>/audiobook.mp3",
     )
     parser.add_argument(
         "--run-root",
@@ -715,6 +826,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_PAUSE_MS,
         help=f"Pause between batch chunks in milliseconds (default: {DEFAULT_PAUSE_MS}).",
+    )
+    parser.add_argument(
+        "--mp3-quality",
+        type=int,
+        default=0,
+        help="MP3 quality for libmp3lame (0=best, 9=smallest). Used when output is .mp3.",
     )
     parser.add_argument(
         "--inference-batch-size",
@@ -789,6 +906,9 @@ def main() -> int:
         return 2
     if args.pause_ms < 0:
         print("ERROR: --pause-ms cannot be negative.", file=sys.stderr)
+        return 2
+    if args.mp3_quality < 0 or args.mp3_quality > 9:
+        print("ERROR: --mp3-quality must be between 0 and 9.", file=sys.stderr)
         return 2
     if args.inference_batch_size < 1:
         print("ERROR: --inference-batch-size must be at least 1.", file=sys.stderr)
@@ -866,6 +986,11 @@ def main() -> int:
         if is_resume and args.pause_ms == DEFAULT_PAUSE_MS and state.get("pause_ms")
         else args.pause_ms
     )
+    mp3_quality = (
+        int(state["mp3_quality"])
+        if is_resume and args.mp3_quality == 0 and state.get("mp3_quality") is not None
+        else args.mp3_quality
+    )
     inference_batch_size = (
         int(state["inference_batch_size"])
         if is_resume
@@ -909,13 +1034,28 @@ def main() -> int:
         and state.get("attn_implementation")
         else args.attn_implementation
     )
-    output_wav = (
+    output_target = (
         args.output.resolve()
         if args.output
-        else Path(state["output_wav"]).resolve()
-        if is_resume and state.get("output_wav")
+        else Path(state.get("output_audio") or state.get("output_wav")).resolve()
+        if is_resume and (state.get("output_audio") or state.get("output_wav"))
         else run_dir / DEFAULT_OUTPUT_NAME
     )
+    if output_target.suffix == "":
+        output_target = output_target.with_suffix(".mp3")
+    output_suffix = output_target.suffix.lower()
+    if output_suffix not in (".mp3", ".wav"):
+        print(
+            "ERROR: --output must end with .mp3 or .wav (or omit extension to default to .mp3).",
+            file=sys.stderr,
+        )
+        return 2
+    if output_suffix == ".mp3" and not shutil.which("ffmpeg"):
+        print(
+            "ERROR: ffmpeg is required for MP3 output but was not found in PATH.",
+            file=sys.stderr,
+        )
+        return 2
 
     reference_text_file: Path | None = None
     if reference_text:
@@ -1041,7 +1181,8 @@ def main() -> int:
                 if reference_text_file
                 else None,
                 "x_vector_only_mode": x_vector_only_mode,
-                "output_wav": str(output_wav),
+                "output_audio": str(output_target),
+                "output_wav": str(output_target),
                 "model_id": model_id,
                 "device": device,
                 "dtype": dtype_name,
@@ -1049,6 +1190,7 @@ def main() -> int:
                 "language": language,
                 "max_chars_per_batch": max_chars,
                 "pause_ms": pause_ms,
+                "mp3_quality": mp3_quality,
                 "inference_batch_size": inference_batch_size,
                 "max_inference_chars": max_inference_chars,
                 "part_files": part_files,
@@ -1068,9 +1210,10 @@ def main() -> int:
         runtime_options = {
             "reference_audio": reference_audio,
             "reference_text_file": reference_text_file,
-            "output_wav": output_wav,
+            "output_wav": output_target,
             "max_chars_per_batch": max_chars,
             "pause_ms": pause_ms,
+            "mp3_quality": mp3_quality,
             "inference_batch_size": inference_batch_size,
             "max_inference_chars": max_inference_chars,
             "language": language,
@@ -1107,9 +1250,60 @@ def main() -> int:
             }
             if language.lower() != "auto":
                 kwargs["language"] = language
-            wavs, sample_rate = model.generate_voice_clone(**kwargs)
+
+            wavs: Any
+            sample_rate: Any
+            cancel_succeeded = False
+            discard_batch_after_completion = False
+            stop_message_shown = False
+            abort_message_shown = False
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(model.generate_voice_clone, **kwargs)
+                while True:
+                    try:
+                        wavs, sample_rate = future.result(timeout=0.15)
+                        break
+                    except concurrent.futures.TimeoutError:
+                        if stop_controller.stop_requested and not stop_message_shown:
+                            stop_message_shown = True
+                            progress.mark_stop_requested()
+                            if args.no_defrag_ui:
+                                print(
+                                    "Stop requested; finishing current batch (Ctrl+C again to try abort)."
+                                )
+                        if stop_controller.abort_current_batch and not abort_message_shown:
+                            abort_message_shown = True
+                            progress.mark_abort_requested()
+                            if args.no_defrag_ui:
+                                print(
+                                    "Abort requested; attempting to cancel current batch..."
+                                )
+                            cancel_succeeded = future.cancel()
+                            if cancel_succeeded:
+                                break
+                            discard_batch_after_completion = True
+                        continue
+
+            if cancel_succeeded:
+                progress.mark_batch_aborted(canceled=True)
+                stop_controller.request_stop()
+                if args.no_defrag_ui:
+                    print(
+                        f"Batch {global_batch}: canceled before execution; will remain in continue file."
+                    )
+                break
+
             if not wavs:
                 raise RuntimeError(f"Empty audio output for {batch_label}.")
+
+            if discard_batch_after_completion:
+                progress.mark_batch_aborted(canceled=False)
+                stop_controller.request_stop()
+                if args.no_defrag_ui:
+                    print(
+                        f"Batch {global_batch}: could not be interrupted; output discarded so it remains in continue file."
+                    )
+                break
 
             duration = time.time() - started
             part_path = parts_dir / f"batch_{global_batch:05d}.wav"
@@ -1137,14 +1331,31 @@ def main() -> int:
                 progress.mark_stop_requested()
                 break
 
+        combined_wav_path = (
+            output_target
+            if output_suffix == ".wav"
+            else run_dir / "audiobook_combined_intermediate.wav"
+        )
         progress.set_status("Combining audio parts with pauses...")
         sample_rate_out, duration_out = combine_parts_with_pause(
             sf=sf,
             np=np,
             part_paths=resolve_paths(run_dir, part_files),
-            output_wav_path=output_wav,
+            output_wav_path=combined_wav_path,
             pause_ms=pause_ms,
         )
+        if output_suffix == ".mp3":
+            progress.set_status("Encoding high-quality MP3...")
+            convert_wav_to_mp3(
+                input_wav=combined_wav_path,
+                output_mp3=output_target,
+                quality_level=mp3_quality,
+            )
+            if combined_wav_path.exists():
+                try:
+                    combined_wav_path.unlink()
+                except OSError:
+                    pass
 
         remaining = batches[completed_this_run:]
         if remaining:
@@ -1168,8 +1379,8 @@ def main() -> int:
             )
             save_state(state_path, state)
             progress.stop("Stopped early. Continue assets were generated.")
-            print("Stopped early after current inference call.")
-            print(f"Audio: {output_wav}")
+            print("Stopped early. Continue assets were generated.")
+            print(f"Audio: {output_target}")
             print(f"State: {state_path}")
             print(f"Remaining text: {assets['remaining_text_file']}")
             print(f"Continue script (bash): {assets['continue_script_sh']}")
@@ -1188,7 +1399,7 @@ def main() -> int:
         )
         save_state(state_path, state)
         progress.stop("Audiobook generation complete.")
-        print(f"Done: {output_wav}")
+        print(f"Done: {output_target}")
         print(f"Batches rendered this run: {completed_this_run}")
         print(f"Total combined duration: {duration_out:.1f}s at {sample_rate_out} Hz")
         print(f"State: {state_path}")

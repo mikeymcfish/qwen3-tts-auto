@@ -8,13 +8,16 @@ Simple CLI app that turns a `.txt` file into an audiobook with Qwen3-TTS voice c
 - Splits text into paragraph-aware batches.
 - Combines short paragraphs until `--max-chars-per-batch` is reached.
 - Batch boundaries only happen between paragraphs.
-- Combines all generated parts into one final WAV with a configurable pause between batches.
+- Combines all generated parts with pause spacing, then outputs high-quality MP3 by default.
 - Defrag-style live progress UI where each batch uses one block per 200 chars:
   - red: pending
   - blue: currently processing
   - green: just completed
   - white: completed
-- Graceful stop: press `Ctrl+C` once, current inference call finishes, then app exits.
+- Cooler animated terminal style with scan beam + pulse effects.
+- Graceful stop controls:
+  - `Ctrl+C` once: stop after current batch
+  - `Ctrl+C` twice: attempt to cancel current batch; if not interruptible, output is discarded and batch is kept for resume
 - Auto-generated resume assets on early stop:
   - new `.txt` with remaining text
   - `continue_*.sh`
@@ -44,7 +47,7 @@ python audiobook_qwen3.py \
   --text-file /path/book.txt \
   --reference-audio /path/voice_ref.wav \
   --reference-text-file /path/voice_ref_transcript.txt \
-  --output /path/book_audiobook.wav \
+  --output /path/book_audiobook.mp3 \
   --max-chars-per-batch 1800 \
   --pause-ms 300 \
   --language Auto
@@ -58,9 +61,10 @@ python audiobook_qwen3.py \
 - `--x-vector-only-mode`: allow cloning without transcript.
 - `--max-chars-per-batch`: batch size control in characters.
 - `--pause-ms`: silence inserted between batch outputs.
+- `--mp3-quality`: MP3 VBR quality for final encode (`0` best, `9` smallest).
 - `--inference-batch-size`: compatibility option; batched mode is disabled and forced to `1`.
 - `--max-inference-chars`: compatibility option retained for old scripts; ignored.
-- `--output`: final combined WAV file.
+- `--output`: final path (`.mp3` recommended, `.wav` supported).
 - `--resume-state`: continue from an existing `session_state.json`.
 - `--attn-implementation`: attention backend (`sdpa` default, `flash_attention_2` optional).
 - `--dtype`: model precision (`bfloat16` default, auto-fallback to `float16` if unsupported).
@@ -71,8 +75,8 @@ python audiobook_qwen3.py \
 Press `Ctrl+C` once while running.
 
 Behavior:
-1. Current inference call finishes.
-2. Existing parts are still combined into current output WAV.
+1. Current batch is completed, or cancel is attempted for current batch on second `Ctrl+C`.
+2. Existing completed parts are combined into current output audio.
 3. The app writes:
    - `continue_from_batch_XXXXX.txt`
    - `continue_from_batch_XXXXX.sh`
@@ -83,7 +87,7 @@ Run the generated continue script to finish remaining text.
 
 ## Notes
 
-- Default model is `Qwen/Qwen3-TTS-12Hz-0.6B-Base`.
+- Default model is `Qwen/Qwen3-TTS-12Hz-1.7B-Base`.
 - Default attention is `sdpa` for reliability. If `flash-attn` is installed, you can use `--attn-implementation flash_attention_2`.
 - This project follows Qwen3-TTS API patterns from the official repository:
   - https://github.com/QwenLM/Qwen3-TTS
