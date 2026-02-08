@@ -37,6 +37,7 @@ This installer:
 - checks for `nvidia-smi`
 - creates `.venv`
 - installs CUDA PyTorch wheels
+- installs system audio tools (`ffmpeg`, `sox`)
 - installs Python dependencies
 - attempts optional `flash-attn`
 
@@ -141,4 +142,23 @@ If CPU works and CUDA still asserts, try this explicit GPU-safe combo first:
 
 ```bash
 python audiobook_qwen3.py ... --dtype bfloat16 --attn-implementation sdpa --language Auto
+```
+
+If you see:
+- `/bin/sh: 1: sox: not found`
+
+Install SoX on the pod:
+
+```bash
+apt-get update && apt-get install -y sox
+```
+
+If you see:
+- `flash_attn_2_cuda ... undefined symbol ...`
+
+Then installed `flash-attn` is ABI-mismatched with your torch build. Use SDPA or reinstall:
+
+```bash
+python -m pip uninstall -y flash-attn flash_attn
+python audiobook_qwen3.py ... --attn-implementation sdpa
 ```

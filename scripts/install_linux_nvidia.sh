@@ -41,13 +41,14 @@ if command -v apt-get >/dev/null 2>&1; then
       python3-venv \
       python3-pip \
       ffmpeg \
+      sox \
       git \
       build-essential \
       libsndfile1
   fi
 else
   echo "apt-get not found."
-  echo "Install manually: python3 python3-venv python3-pip ffmpeg build-essential libsndfile1"
+  echo "Install manually: python3 python3-venv python3-pip ffmpeg sox build-essential libsndfile1"
 fi
 
 echo "[2/6] Creating virtual environment..."
@@ -80,7 +81,7 @@ echo "[5/6] Installing project Python dependencies..."
 python -m pip install --upgrade -r requirements.txt
 
 echo "[6/6] Installing optional flash-attn..."
-INSTALL_FLASH_ATTN="1"
+INSTALL_FLASH_ATTN="${INSTALL_FLASH_ATTN:-1}"
 if [[ "${GPU_CC_MAJOR}" -lt 8 ]]; then
   INSTALL_FLASH_ATTN="0"
   echo "Skipping flash-attn: GPU compute capability ${GPU_CC_RAW} is below 8.0."
@@ -91,6 +92,7 @@ if [[ "${GPU_CC_MAJOR}" -ge 12 ]]; then
 fi
 
 if [[ "${INSTALL_FLASH_ATTN}" == "1" ]] && python -c "import torch; import sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
+  python -m pip uninstall -y flash-attn flash_attn >/dev/null 2>&1 || true
   if python -m pip install --upgrade flash-attn --no-build-isolation --no-clean; then
     echo "flash-attn installed."
   else
@@ -99,6 +101,11 @@ if [[ "${INSTALL_FLASH_ATTN}" == "1" ]] && python -c "import torch; import sys; 
   fi
 else
   echo "Torch CUDA is unavailable or flash-attn was skipped."
+fi
+
+if ! command -v sox >/dev/null 2>&1; then
+  echo "WARNING: sox is still missing from PATH."
+  echo "Install it manually (Debian/Ubuntu): apt-get update && apt-get install -y sox"
 fi
 
 cat <<'EOF'

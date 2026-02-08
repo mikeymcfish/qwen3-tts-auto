@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import importlib
 import importlib.util
 import json
 import re
@@ -170,8 +171,10 @@ class StopController:
 
 class DefragProgressView:
     CHARS_PER_BLOCK = 200
-    BLOCKS_PER_ROW = 120
+    MAX_BLOCKS_PER_ROW = 120
+    MIN_BLOCKS_PER_ROW = 32
     DONE_FLASH_SECONDS = 1.4
+    RENDER_INTERVAL_SECONDS = 0.14
     SPINNER_FRAMES = ["|", "/", "-", "\\"]
     COLOR_RESET = "\x1b[0m"
     COLOR_RED = "\x1b[91m"
@@ -182,6 +185,13 @@ class DefragProgressView:
     COLOR_YELLOW = "\x1b[93m"
     COLOR_MAGENTA = "\x1b[95m"
     COLOR_DIM = "\x1b[90m"
+    GLYPH_PENDING = "\u25a0"
+    GLYPH_WORKING_A = "\u25a3"
+    GLYPH_WORKING_B = "\u25a0"
+    GLYPH_DONE = "\u25a0"
+    GLYPH_COMPLETE = "\u25a0"
+    GLYPH_EMPTY = "\u25a1"
+    GLYPH_BEAM = "\u25c8"
 
     def __init__(
         self,
@@ -211,6 +221,8 @@ class DefragProgressView:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._done_flash_until: dict[int, float] = {}
+        self._alt_buffer_active = False
+        self._last_lines: list[str] = []
 
         if batch_char_counts and len(batch_char_counts) == self.total_batches:
             normalized = [max(1, int(v)) for v in batch_char_counts]
@@ -226,6 +238,10 @@ class DefragProgressView:
     def start(self) -> None:
         if not self.enabled:
             return
+        # Use alternate screen buffer to avoid visible flicker in normal terminal history.
+        sys.stdout.write("\x1b[?1049h\x1b[H\x1b[?25l")
+        sys.stdout.flush()
+        self._alt_buffer_active = True
         self._thread = threading.Thread(target=self._render_loop, daemon=True)
         self._thread.start()
 
@@ -301,39 +317,34 @@ class DefragProgressView:
         if self._thread:
             self._thread.join(timeout=1.5)
         sys.stdout.write("\x1b[?25h")
+        if self._alt_buffer_active:
+            sys.stdout.write("\x1b[?1049l")
+            self._alt_buffer_active = False
         sys.stdout.flush()
 
     def _render_loop(self) -> None:
         while not self._stop_event.is_set():
             self._tick += 1
             self._draw_frame(self._build_frame())
-            time.sleep(0.12)
+            if self._stop_event.wait(self.RENDER_INTERVAL_SECONDS):
+                break
         self._draw_frame(self._build_frame())
 
     def _draw_frame(self, frame: str) -> None:
-        sys.stdout.write("\x1b[?25l")
-        sys.stdout.write("\x1b[H\x1b[2J")
-        sys.stdout.write(frame)
-        if not frame.endswith("\n"):
-            sys.stdout.write("\n")
+        lines = frame.splitlines()
+        if lines == self._last_lines:
+            return
+        max_lines = max(len(lines), len(self._last_lines))
+        for row_index in range(max_lines):
+            new_line = lines[row_index] if row_index < len(lines) else ""
+            old_line = self._last_lines[row_index] if row_index < len(self._last_lines) else None
+            if new_line == old_line:
+                continue
+            sys.stdout.write(f"\x1b[{row_index + 1};1H")
+            sys.stdout.write(new_line)
+            sys.stdout.write("\x1b[K")
+        self._last_lines = lines
         sys.stdout.flush()
-
-    def _batch_color(
-        self,
-        batch_number: int,
-        completed_batches: int,
-        active_start: int,
-        active_end: int,
-        now_ts: float,
-        done_flash_until: dict[int, float],
-    ) -> str:
-        if active_start <= batch_number <= active_end:
-            return self.COLOR_BLUE
-        if batch_number <= completed_batches:
-            if done_flash_until.get(batch_number, 0.0) > now_ts:
-                return self.COLOR_GREEN
-            return self.COLOR_WHITE
-        return self.COLOR_RED
 
     def _build_frame(self) -> str:
         with self._lock:
@@ -354,94 +365,93 @@ class DefragProgressView:
         ratio = min(1.0, completed_batches / self.total_batches)
         bar_width = 44
         fill = int(ratio * bar_width)
-        bar = "#" * fill + "." * (bar_width - fill)
+        bar = (
+            f"{self.COLOR_GREEN}{self.GLYPH_DONE * fill}{self.COLOR_RESET}"
+            f"{self.COLOR_DIM}{self.GLYPH_EMPTY * (bar_width - fill)}{self.COLOR_RESET}"
+        )
         percent = ratio * 100.0
 
         elapsed = time.time() - self._start_time
         eta = avg_batch_seconds * max(0, self.total_batches - completed_batches)
         now_ts = time.time()
         spinner = self.SPINNER_FRAMES[self._tick % len(self.SPINNER_FRAMES)]
+        terminal_columns = shutil.get_terminal_size(fallback=(120, 40)).columns
+        blocks_per_row = max(
+            self.MIN_BLOCKS_PER_ROW,
+            min(self.MAX_BLOCKS_PER_ROW, max(8, terminal_columns - 8)),
+        )
 
         total_blocks = sum(self._batch_block_counts)
         completed_blocks = sum(self._batch_block_counts[:completed_batches])
         throughput = completed_chars / elapsed if elapsed > 0 else 0.0
-        beam_index = (self._tick * 3) % max(1, total_blocks)
         beat = self._tick % 4
 
         lines: list[str] = []
         line_parts: list[str] = []
         visible_len = 0
-        separator = f"{self.COLOR_DIM}|{self.COLOR_RESET}"
-        block_cursor = 0
+        separator = "  "
         for batch_number, block_count in enumerate(self._batch_block_counts, start=1):
-            color = self._batch_color(
-                batch_number=batch_number,
-                completed_batches=completed_batches,
-                active_start=active_start,
-                active_end=active_end,
-                now_ts=now_ts,
-                done_flash_until=done_flash_until,
-            )
-            if active_start <= batch_number <= active_end:
-                active_char = [">", "=", "~", ">"][beat]
-                segment = [active_char for _ in range(block_count)]
-            else:
-                segment = ["#" for _ in range(block_count)]
-
-            if block_cursor <= beam_index < block_cursor + block_count:
-                beam_offset = beam_index - block_cursor
-                segment[beam_offset] = "*"
-
-            segment_text = "".join(segment)
-            if "*" in segment_text:
-                beam_offset = segment_text.index("*")
-                token = (
-                    f"{color}{segment_text[:beam_offset]}"
-                    f"{self.COLOR_CYAN}*{color}{segment_text[beam_offset + 1:]}"
-                    f"{self.COLOR_RESET}{separator}"
+            active_batch = active_start <= batch_number <= active_end
+            if active_batch:
+                color = self.COLOR_BLUE if beat % 2 == 0 else self.COLOR_MAGENTA
+                glyph = (
+                    self.GLYPH_WORKING_A if beat % 2 == 0 else self.GLYPH_WORKING_B
                 )
+            elif batch_number <= completed_batches:
+                if done_flash_until.get(batch_number, 0.0) > now_ts:
+                    color = self.COLOR_GREEN
+                    glyph = self.GLYPH_DONE
+                else:
+                    color = self.COLOR_WHITE
+                    glyph = self.GLYPH_COMPLETE
             else:
-                token = f"{color}{segment_text}{self.COLOR_RESET}{separator}"
+                color = self.COLOR_RED
+                glyph = self.GLYPH_PENDING
 
-            token_visible = block_count + 1
-            if visible_len + token_visible > self.BLOCKS_PER_ROW and line_parts:
+            token = f"{color}{glyph * block_count}{self.COLOR_RESET}"
+            token_visible = block_count + len(separator)
+            if visible_len + token_visible > blocks_per_row and line_parts:
                 lines.append("".join(line_parts))
                 line_parts = []
                 visible_len = 0
-            line_parts.append(token)
+            line_parts.append(token + separator)
             visible_len += token_visible
-            block_cursor += block_count
         if line_parts:
-            lines.append("".join(line_parts))
+            lines.append("".join(line_parts).rstrip())
         if not lines:
             lines.append("(no blocks)")
 
-        scan_bar_len = 38
+        scan_bar_len = max(20, min(56, blocks_per_row // 2))
         scan_pos = self._tick % scan_bar_len
-        scan_chars = ["."] * scan_bar_len
-        scan_chars[scan_pos] = ">"
+        scan_chars = [self.GLYPH_EMPTY] * scan_bar_len
+        scan_chars[scan_pos] = self.GLYPH_BEAM
         if scan_pos + 1 < scan_bar_len:
-            scan_chars[scan_pos + 1] = ">"
+            scan_chars[scan_pos + 1] = self.GLYPH_BEAM
         scanline = (
-            f"{self.COLOR_DIM}{''.join(scan_chars[:max(0, scan_pos - 2)])}"
-            f"{self.COLOR_CYAN}{''.join(scan_chars[max(0, scan_pos - 2):scan_pos + 2])}"
+            f"{self.COLOR_DIM}{''.join(scan_chars[:scan_pos])}{self.COLOR_RESET}"
+            f"{self.COLOR_CYAN}{''.join(scan_chars[scan_pos:scan_pos + 2])}{self.COLOR_RESET}"
             f"{self.COLOR_DIM}{''.join(scan_chars[scan_pos + 2:])}{self.COLOR_RESET}"
         )
+        border = "=" * min(64, max(40, terminal_columns - 2))
 
         header = [
-            f"{self.COLOR_CYAN}=============================================================={self.COLOR_RESET}",
+            f"{self.COLOR_CYAN}{border}{self.COLOR_RESET}",
             f"{self.COLOR_MAGENTA}{spinner}{self.COLOR_RESET} Qwen3-TTS Defrag Animator",
             f"[{bar}] {percent:6.2f}%  batches {completed_batches}/{self.total_batches}  chars {completed_chars}/{self.total_chars}",
             f"elapsed {format_duration(elapsed)}  eta {format_duration(eta)}  throughput {throughput:7.1f} chars/s",
             f"current {current_batch_label}",
-            f"blocks: {completed_blocks}/{total_blocks}  (1 block = {self.CHARS_PER_BLOCK} chars)  beam=*",
+            f"blocks: {completed_blocks}/{total_blocks}  (1 block = {self.CHARS_PER_BLOCK} chars)  grid={blocks_per_row}/row",
             f"scanline {scanline}",
             f"status: {self.COLOR_YELLOW}{status}{self.COLOR_RESET}",
-            "legend: red=pending  blue=working  green=done-now  white=completed  cyan=* scan",
+            f"legend: {self.COLOR_RED}{self.GLYPH_PENDING}{self.COLOR_RESET}=pending  "
+            f"{self.COLOR_BLUE}{self.GLYPH_WORKING_A}{self.COLOR_RESET}=working  "
+            f"{self.COLOR_GREEN}{self.GLYPH_DONE}{self.COLOR_RESET}=done-now  "
+            f"{self.COLOR_WHITE}{self.GLYPH_COMPLETE}{self.COLOR_RESET}=completed  "
+            f"{self.COLOR_CYAN}{self.GLYPH_BEAM}{self.COLOR_RESET}=scan",
             "stop: requested (will exit after current batch)"
             if stop_requested
             else "stop: running (Ctrl+C once stop-after-batch, twice try abort-current)",
-            f"{self.COLOR_CYAN}=============================================================={self.COLOR_RESET}",
+            f"{self.COLOR_CYAN}{border}{self.COLOR_RESET}",
             "",
         ]
         return "\n".join(header + lines)
@@ -581,16 +591,65 @@ def require_runtime_dependencies() -> tuple[Any, Any, Any, Any]:
     return np, sf, torch, Qwen3TTSModel
 
 
+def check_sox_installation() -> str | None:
+    if shutil.which("sox"):
+        return None
+    return (
+        "SoX is not installed (`sox` not found in PATH). "
+        "Qwen-TTS audio preprocessing may fail. "
+        "Install with: apt-get update && apt-get install -y sox"
+    )
+
+
+def probe_flash_attn_runtime() -> tuple[bool, str | None]:
+    has_pkg = importlib.util.find_spec("flash_attn") is not None
+    has_ext = importlib.util.find_spec("flash_attn_2_cuda") is not None
+    if not has_pkg and not has_ext:
+        return False, (
+            "flash-attn is not installed; falling back from flash_attention_2 to sdpa."
+        )
+
+    probe_modules = (
+        "flash_attn_2_cuda",
+        "flash_attn.flash_attn_interface",
+        "flash_attn",
+    )
+    import_errors: list[str] = []
+    for module_name in probe_modules:
+        if importlib.util.find_spec(module_name) is None:
+            continue
+        try:
+            importlib.import_module(module_name)
+            return True, None
+        except Exception as exc:
+            detail = f"{exc.__class__.__name__}: {exc}"
+            import_errors.append(f"{module_name} ({detail})")
+            if "undefined symbol" in str(exc):
+                return False, (
+                    "flash-attn is installed but incompatible with this torch build "
+                    f"({detail}). Falling back to sdpa. "
+                    "Fix by reinstalling a matching flash-attn build, or uninstall it with "
+                    "`python -m pip uninstall -y flash-attn flash_attn`."
+                )
+
+    if import_errors:
+        return False, (
+            "flash-attn is installed but failed runtime import "
+            f"({import_errors[0]}). Falling back to sdpa."
+        )
+    return False, (
+        "flash-attn package was detected but runtime modules were not importable; "
+        "falling back to sdpa."
+    )
+
+
 def choose_attention_implementation(requested: str) -> tuple[str, str | None]:
     if requested != "flash_attention_2":
         return requested, None
-    has_flash_attn = importlib.util.find_spec("flash_attn") is not None
-    if has_flash_attn:
+    flash_ok, warning = probe_flash_attn_runtime()
+    if flash_ok:
         return requested, None
-    return (
-        "sdpa",
-        "flash-attn is not installed; falling back from flash_attention_2 to sdpa.",
-    )
+    return ("sdpa", warning)
 
 
 def choose_dtype(torch: Any, requested: str, device: str) -> tuple[str, str | None]:
@@ -1112,6 +1171,12 @@ def main() -> int:
 
     try:
         np, sf, torch, Qwen3TTSModel = require_runtime_dependencies()
+        sox_warning = check_sox_installation()
+        if sox_warning:
+            progress.set_status(sox_warning)
+            if args.no_defrag_ui:
+                print(f"WARNING: {sox_warning}")
+
         arch_fatal, arch_message = check_cuda_arch_compatibility(torch, device)
         if arch_message:
             progress.set_status(arch_message)

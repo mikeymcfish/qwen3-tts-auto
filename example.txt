@@ -1,7 +1,8 @@
 python audiobook_qwen3.py \
-  --text-file TEST.txt \
+  --text-file bud.txt \
   --reference-audio griffin_3s.wav \
   --reference-text-file griffin_3s.txt \
-  --dtype bfloat16 \
+  --dtype float16 \
   --attn-implementation flash_attention_2 \
-  --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base
+  --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --no-defrag-ui
