@@ -541,12 +541,20 @@ def choose_dtype(torch: Any, requested: str, device: str) -> tuple[str, str | No
     )
 
 
-def check_cuda_arch_compatibility(torch: Any, device: str) -> str | None:
+def check_cuda_arch_compatibility(torch: Any, device: str) -> tuple[bool, str | None]:
+    def extract_arch_code(tag: str, prefix: str) -> int | None:
+        if not tag.startswith(prefix):
+            return None
+        suffix = tag[len(prefix) :]
+        if not suffix.isdigit():
+            return None
+        return int(suffix)
+
     device_lower = device.lower()
     if not device_lower.startswith("cuda"):
-        return None
+        return False, None
     if not torch.cuda.is_available():
-        return (
+        return True, (
             "CUDA device was requested but torch.cuda.is_available() is False. "
             "Install CUDA-enabled PyTorch or use --device cpu."
         )
@@ -560,16 +568,51 @@ def check_cuda_arch_compatibility(torch: Any, device: str) -> str | None:
         target_arch = f"sm_{cap_major}{cap_minor}"
         supported_arches = list(torch.cuda.get_arch_list())
     except Exception:
-        return None
+        return False, None
 
     if target_arch in supported_arches:
-        return None
+        return False, None
 
-    return (
-        "PyTorch CUDA build likely does not include kernels for your GPU "
+    target_code = cap_major * 10 + cap_minor
+    sm_codes = [
+        code
+        for code in (
+            extract_arch_code(arch, "sm_") for arch in supported_arches
+        )
+        if code is not None
+    ]
+    compute_codes = [
+        code
+        for code in (
+            extract_arch_code(arch, "compute_") for arch in supported_arches
+        )
+        if code is not None
+    ]
+
+    # CUDA cubins are forward-compatible within the same major architecture.
+    # Example: sm_86 kernels can execute on sm_89 (RTX 4090).
+    same_major_compatible = any(
+        (code // 10) == cap_major and (code % 10) <= cap_minor for code in sm_codes
+    )
+    if same_major_compatible:
+        return False, (
+            f"No exact {target_arch} kernel in this torch build; using same-major compatibility. "
+            f"GPU: {device_name}. Installed arches: {supported_arches}."
+        )
+
+    # PTX may still JIT on newer GPUs when compute targets are present.
+    ptx_candidate = any(code <= target_code for code in compute_codes)
+    if ptx_candidate:
+        return False, (
+            f"No exact {target_arch} kernel in this torch build; PTX JIT may be used. "
+            f"GPU: {device_name}. Installed arches: {supported_arches}."
+        )
+
+    return False, (
+        "PyTorch CUDA build may not include optimal kernels for your GPU "
         f"({device_name}, {target_arch}). Installed arches: {supported_arches}. "
-        "On RunPod, reinstall torch with a newer CUDA index URL (for example cu128) "
-        "or choose a pod GPU architecture supported by this torch build."
+        "If runtime errors appear, reinstall torch with a different CUDA index URL "
+        "(for example cu128) or use a matching pod image."
     )
 
 
@@ -926,9 +969,13 @@ def main() -> int:
 
     try:
         np, sf, torch, Qwen3TTSModel = require_runtime_dependencies()
-        arch_issue = check_cuda_arch_compatibility(torch, device)
-        if arch_issue:
-            raise RuntimeError(arch_issue)
+        arch_fatal, arch_message = check_cuda_arch_compatibility(torch, device)
+        if arch_message:
+            progress.set_status(arch_message)
+            if args.no_defrag_ui:
+                print(f"WARNING: {arch_message}")
+        if arch_fatal and arch_message:
+            raise RuntimeError(arch_message)
 
         dtype_name, dtype_warning = choose_dtype(torch, dtype_name, device)
         if dtype_warning:

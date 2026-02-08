@@ -1,1 +1,4 @@
-python audiobook_qwen3.py --text-file TEST.txt --reference-audio griffin_3s.wav --reference-text-file griffin_3s.txt --attn-implementation sdpa --dtype float16 --inference-batch-size 1
+python audiobook_qwen3.py --text-file TEST.txt --reference-audio griffin_3s.wav --reference-text-file griffin_3s.txt --dtype float16 --inference-batch-size 1
+
+notes:
+python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128

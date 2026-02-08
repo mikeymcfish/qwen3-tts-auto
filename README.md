@@ -114,6 +114,9 @@ If your GPU capability is missing from `arches`, reinstall torch with a newer in
 python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
+Note: on some GPUs (for example RTX 4090 `sm_89`), torch may list `sm_86` without `sm_89`.  
+That can still work through same-major forward compatibility.
+
 And run with safe settings:
 
 ```bash
