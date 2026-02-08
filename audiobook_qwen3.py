@@ -6,6 +6,7 @@ Create audiobook WAV files from text using Qwen3-TTS voice cloning.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import shlex
@@ -23,6 +24,7 @@ DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 DEFAULT_OUTPUT_NAME = "audiobook.wav"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_PAUSE_MS = 300
+DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
 
 
 @dataclass
@@ -423,6 +425,18 @@ def require_runtime_dependencies() -> tuple[Any, Any, Any, Any]:
     return np, sf, torch, Qwen3TTSModel
 
 
+def choose_attention_implementation(requested: str) -> tuple[str, str | None]:
+    if requested != "flash_attention_2":
+        return requested, None
+    has_flash_attn = importlib.util.find_spec("flash_attn") is not None
+    if has_flash_attn:
+        return requested, None
+    return (
+        "sdpa",
+        "flash-attn is not installed; falling back from flash_attention_2 to sdpa.",
+    )
+
+
 def combine_parts_with_pause(
     sf: Any,
     np: Any,
@@ -550,8 +564,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attn-implementation",
         type=str,
-        default="flash_attention_2",
-        help="Attention implementation for qwen-tts model loading.",
+        default=DEFAULT_ATTN_IMPLEMENTATION,
+        help=(
+            "Attention implementation for qwen-tts model loading "
+            f"(default: {DEFAULT_ATTN_IMPLEMENTATION})."
+        ),
     )
     parser.add_argument(
         "--no-defrag-ui",
@@ -668,7 +685,7 @@ def main() -> int:
     attn = (
         str(state["attn_implementation"])
         if is_resume
-        and args.attn_implementation == "flash_attention_2"
+        and args.attn_implementation == DEFAULT_ATTN_IMPLEMENTATION
         and state.get("attn_implementation")
         else args.attn_implementation
     )
@@ -717,17 +734,41 @@ def main() -> int:
 
     try:
         np, sf, torch, Qwen3TTSModel = require_runtime_dependencies()
+        attn, attn_warning = choose_attention_implementation(attn)
+        if attn_warning:
+            progress.set_status(attn_warning)
+            if args.no_defrag_ui:
+                print(f"WARNING: {attn_warning}")
         dtype_map = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
             "float32": torch.float32,
         }
-        model = Qwen3TTSModel.from_pretrained(
-            model_id,
-            device_map=device,
-            dtype=dtype_map[dtype_name],
-            attn_implementation=attn,
-        )
+        try:
+            model = Qwen3TTSModel.from_pretrained(
+                model_id,
+                device_map=device,
+                dtype=dtype_map[dtype_name],
+                attn_implementation=attn,
+            )
+        except Exception as model_exc:
+            if attn != "sdpa":
+                fallback_msg = (
+                    f"Model load failed with attn '{attn}', retrying with 'sdpa'. "
+                    f"Reason: {model_exc}"
+                )
+                progress.set_status(fallback_msg)
+                if args.no_defrag_ui:
+                    print(f"WARNING: {fallback_msg}")
+                attn = "sdpa"
+                model = Qwen3TTSModel.from_pretrained(
+                    model_id,
+                    device_map=device,
+                    dtype=dtype_map[dtype_name],
+                    attn_implementation=attn,
+                )
+            else:
+                raise
         progress.set_status("Building clone prompt...")
         clone_prompt = model.create_voice_clone_prompt(
             ref_audio=reference_audio,

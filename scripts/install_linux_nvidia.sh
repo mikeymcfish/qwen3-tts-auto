@@ -16,6 +16,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_DIR}"
 
+# Keep pip build/cache/temp on the same filesystem to avoid cross-device rename issues.
+export PIP_CACHE_DIR="${REPO_DIR}/.pip-cache"
+export TMPDIR="${REPO_DIR}/.pip-tmp"
+mkdir -p "${PIP_CACHE_DIR}" "${TMPDIR}"
+
 echo "[1/6] Installing base system packages..."
 if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update
@@ -47,10 +52,11 @@ python -m pip install --upgrade -r requirements.txt
 
 echo "[6/6] Installing optional flash-attn..."
 if python -c "import torch; import sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
-  if python -m pip install --upgrade flash-attn --no-build-isolation; then
+  if python -m pip install --upgrade flash-attn --no-build-isolation --no-clean; then
     echo "flash-attn installed."
   else
     echo "flash-attn installation failed; continuing without it."
+    echo "You can still run the app; it will use sdpa attention by default."
   fi
 else
   echo "Torch CUDA is unavailable; skipping flash-attn."
