@@ -58,8 +58,8 @@ python audiobook_qwen3.py \
 - `--x-vector-only-mode`: allow cloning without transcript.
 - `--max-chars-per-batch`: batch size control in characters.
 - `--pause-ms`: silence inserted between batch outputs.
-- `--inference-batch-size`: number of text batches generated per model call.
-- `--max-inference-chars`: max total characters per model call in batched mode.
+- `--inference-batch-size`: compatibility option; batched mode is disabled and forced to `1`.
+- `--max-inference-chars`: compatibility option retained for old scripts; ignored.
 - `--output`: final combined WAV file.
 - `--resume-state`: continue from an existing `session_state.json`.
 - `--attn-implementation`: attention backend (`sdpa` default, `flash_attention_2` optional).
@@ -120,8 +120,7 @@ That can still work through same-major forward compatibility.
 And run with safe settings:
 
 ```bash
-python audiobook_qwen3.py ... --dtype float16 --attn-implementation sdpa --inference-batch-size 2 --max-inference-chars 2200
+python audiobook_qwen3.py ... --dtype float16 --attn-implementation sdpa
 ```
 
-If GPU usage is low, increase `--inference-batch-size` gradually (for example `2`, `4`, then `6`) while watching VRAM.
-If batched inference causes CUDA asserts, reduce `--inference-batch-size` and/or `--max-inference-chars`.
+Batched inference was removed for stability after repeated CUDA assert failures on some GPU setups.

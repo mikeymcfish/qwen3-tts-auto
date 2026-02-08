@@ -721,8 +721,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "How many text batches to generate per model call. "
-            "Higher values can improve GPU utilization but use more VRAM."
+            "Compatibility option. Batched inference is disabled for stability; "
+            "values greater than 1 are ignored."
         ),
     )
     parser.add_argument(
@@ -730,8 +730,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_INFERENCE_CHARS,
         help=(
-            "Upper limit of total characters per model call when using "
-            "--inference-batch-size > 1."
+            "Compatibility option retained for older continue scripts; ignored."
         ),
     )
     parser.add_argument(
@@ -793,9 +792,6 @@ def main() -> int:
         return 2
     if args.inference_batch_size < 1:
         print("ERROR: --inference-batch-size must be at least 1.", file=sys.stderr)
-        return 2
-    if args.max_inference_chars < 200:
-        print("ERROR: --max-inference-chars must be at least 200.", file=sys.stderr)
         return 2
 
     is_resume = args.resume_state is not None
@@ -884,6 +880,13 @@ def main() -> int:
         and state.get("max_inference_chars")
         else args.max_inference_chars
     )
+    if inference_batch_size != 1:
+        warning = (
+            f"--inference-batch-size={inference_batch_size} requested, "
+            "but batched inference is disabled for stability; forcing to 1."
+        )
+        print(f"WARNING: {warning}")
+        inference_batch_size = 1
     language = (
         str(state["language"])
         if is_resume and args.language == "Auto" and state.get("language")
@@ -1080,149 +1083,56 @@ def main() -> int:
         }
         script_path = Path(__file__).resolve()
 
-        local_index = 0
-        while local_index < len(batches):
+        for local_index, batch in enumerate(batches, start=1):
             if stop_controller.force_stop:
                 break
 
-            effective_inference_batch_size = max(1, inference_batch_size)
-            if stop_controller.stop_requested:
-                progress.mark_stop_requested()
-                effective_inference_batch_size = 1
-
-            group_cap_chars = max(200, max_inference_chars)
-            selected_count = 0
-            selected_chars = 0
-            for candidate in batches[
-                local_index : local_index + effective_inference_batch_size
-            ]:
-                next_chars = selected_chars + candidate.char_count
-                if selected_count > 0 and next_chars > group_cap_chars:
-                    break
-                selected_count += 1
-                selected_chars = next_chars
-            if selected_count <= 0:
-                selected_count = 1
-            group = batches[local_index : local_index + selected_count]
-            global_first = existing_batches + completed_this_run + 1
-            global_last = global_first + len(group) - 1
-            group_chars = sum(item.char_count for item in group)
-            if len(group) == 1:
-                batch_label = f"batch {global_first}/{total_batches} ({group_chars} chars)"
-            else:
-                batch_label = (
-                    f"batches {global_first}-{global_last}/{total_batches} "
-                    f"({group_chars} chars total)"
-                )
+            global_batch = existing_batches + completed_this_run + 1
+            batch_label = f"batch {global_batch}/{total_batches} ({batch.char_count} chars)"
 
             progress.set_active_batch(
-                global_first,
-                group_chars,
+                global_batch,
+                batch.char_count,
                 f"Generating {batch_label}...",
                 batch_label=batch_label,
-                active_batch_count=len(group),
+                active_batch_count=1,
             )
             if args.no_defrag_ui:
                 print(f"{batch_label}: generating...")
 
             started = time.time()
-            text_payload: str | list[str]
-            if len(group) == 1:
-                text_payload = group[0].text
-            else:
-                text_payload = [item.text for item in group]
             kwargs: dict[str, Any] = {
-                "text": text_payload,
+                "text": batch.text,
                 "voice_clone_prompt": clone_prompt,
             }
             if language.lower() != "auto":
                 kwargs["language"] = language
-            try:
-                wavs, sample_rate = model.generate_voice_clone(**kwargs)
-            except Exception as gen_exc:
-                gen_error = str(gen_exc)
-                gen_error_lower = gen_error.lower()
-                is_cuda_assert = (
-                    "device-side assert triggered" in gen_error_lower
-                    or "cudaerrorassert" in gen_error_lower
-                )
-                if len(group) > 1 and is_cuda_assert:
-                    raise RuntimeError(
-                        "CUDA device-side assert triggered during batched inference. "
-                        "Restart this process and retry with smaller settings, "
-                        "for example --inference-batch-size 1 or a lower --max-inference-chars."
-                    ) from gen_exc
-                if len(group) > 1:
-                    progress.set_status(
-                        "Batched call failed; retrying batches one-by-one."
-                    )
-                    if args.no_defrag_ui:
-                        print(
-                            "WARNING: Batched call failed; retrying one-by-one. "
-                            f"Reason: {gen_error}"
-                        )
-                    wavs = []
-                    sample_rate = None
-                    for single in group:
-                        single_kwargs: dict[str, Any] = {
-                            "text": single.text,
-                            "voice_clone_prompt": clone_prompt,
-                        }
-                        if language.lower() != "auto":
-                            single_kwargs["language"] = language
-                        single_wavs, single_rate = model.generate_voice_clone(
-                            **single_kwargs
-                        )
-                        if not single_wavs:
-                            raise RuntimeError(
-                                "Empty audio output while retrying single-batch generation."
-                            )
-                        if sample_rate is None:
-                            sample_rate = int(single_rate)
-                        elif int(single_rate) != int(sample_rate):
-                            raise RuntimeError(
-                                "Sample-rate mismatch across sequential fallback outputs."
-                            )
-                        wavs.append(single_wavs[0])
-                else:
-                    raise
+            wavs, sample_rate = model.generate_voice_clone(**kwargs)
             if not wavs:
                 raise RuntimeError(f"Empty audio output for {batch_label}.")
-            if len(wavs) != len(group):
-                raise RuntimeError(
-                    f"Model returned {len(wavs)} clips for {len(group)} batches in {batch_label}."
-                )
 
-            call_duration = time.time() - started
-            per_batch_duration = call_duration / max(1, len(group))
-            for offset, batch in enumerate(group):
-                global_batch = global_first + offset
-                part_path = parts_dir / f"batch_{global_batch:05d}.wav"
-                sf.write(str(part_path), wavs[offset], sample_rate)
-                part_files.append(str(part_path.relative_to(run_dir).as_posix()))
+            duration = time.time() - started
+            part_path = parts_dir / f"batch_{global_batch:05d}.wav"
+            sf.write(str(part_path), wavs[0], sample_rate)
+            part_files.append(str(part_path.relative_to(run_dir).as_posix()))
 
-                completed_this_run += 1
-                completed_chars_total += batch.char_count
-                state_batch_chars.append(batch.char_count)
-                progress.mark_batch_complete(batch.char_count, per_batch_duration)
-                if args.no_defrag_ui:
-                    print(
-                        f"Batch {global_batch}: complete "
-                        f"(group call {call_duration:.1f}s, per-batch {per_batch_duration:.1f}s)"
-                    )
+            completed_this_run += 1
+            completed_chars_total += batch.char_count
+            state_batch_chars.append(batch.char_count)
+            progress.mark_batch_complete(batch.char_count, duration)
+            if args.no_defrag_ui:
+                print(f"Batch {global_batch}: complete in {duration:.1f}s")
 
-                state["part_files"] = part_files
-                state["batch_char_counts"] = state_batch_chars
-                state["completed_batches"] = len(part_files)
-                state["completed_characters"] = completed_chars_total
-                state["sample_rate"] = int(sample_rate)
-                state["updated_at"] = now_iso()
-                save_state(state_path, state)
+            state["part_files"] = part_files
+            state["batch_char_counts"] = state_batch_chars
+            state["completed_batches"] = len(part_files)
+            state["completed_characters"] = completed_chars_total
+            state["sample_rate"] = int(sample_rate)
+            state["updated_at"] = now_iso()
+            save_state(state_path, state)
 
-                if args.stop_after_batch > 0 and completed_this_run >= args.stop_after_batch:
-                    stop_controller.request_stop()
-
-            local_index += len(group)
+            if args.stop_after_batch > 0 and local_index >= args.stop_after_batch:
+                stop_controller.request_stop()
             if stop_controller.stop_requested:
                 progress.mark_stop_requested()
                 break
@@ -1288,7 +1198,7 @@ def main() -> int:
         if "device-side assert triggered" in error_text.lower():
             error_text += (
                 " | CUDA context is now invalid for this process. Restart and retry with "
-                "--inference-batch-size 1 or a lower --max-inference-chars."
+                "single-batch generation (this app now forces one batch per inference call)."
             )
         if "no kernel image is available for execution on the device" in error_text:
             error_text += (
