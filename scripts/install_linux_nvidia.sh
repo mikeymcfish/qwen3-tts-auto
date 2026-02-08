@@ -44,14 +44,40 @@ source .venv/bin/activate
 echo "[3/6] Upgrading pip tooling..."
 python -m pip install --upgrade pip setuptools wheel
 
-echo "[4/6] Installing PyTorch CUDA wheels..."
-python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+GPU_CC_RAW="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | xargs || true)"
+GPU_CC_MAJOR="${GPU_CC_RAW%%.*}"
+GPU_CC_MINOR="${GPU_CC_RAW##*.}"
+if [[ -z "${GPU_CC_MAJOR}" || "${GPU_CC_MAJOR}" == "${GPU_CC_RAW}" ]]; then
+  GPU_CC_MAJOR="0"
+fi
+if [[ -z "${GPU_CC_MINOR}" || "${GPU_CC_MINOR}" == "${GPU_CC_RAW}" ]]; then
+  GPU_CC_MINOR="0"
+fi
+
+TORCH_INDEX_URL_DEFAULT="https://download.pytorch.org/whl/cu121"
+if [[ "${GPU_CC_MAJOR}" -ge 12 ]]; then
+  TORCH_INDEX_URL_DEFAULT="https://download.pytorch.org/whl/cu128"
+fi
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-${TORCH_INDEX_URL_DEFAULT}}"
+
+echo "[4/6] Installing PyTorch CUDA wheels from ${TORCH_INDEX_URL}..."
+python -m pip install --upgrade torch torchvision torchaudio --index-url "${TORCH_INDEX_URL}"
 
 echo "[5/6] Installing project Python dependencies..."
 python -m pip install --upgrade -r requirements.txt
 
 echo "[6/6] Installing optional flash-attn..."
-if python -c "import torch; import sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
+INSTALL_FLASH_ATTN="1"
+if [[ "${GPU_CC_MAJOR}" -lt 8 ]]; then
+  INSTALL_FLASH_ATTN="0"
+  echo "Skipping flash-attn: GPU compute capability ${GPU_CC_RAW} is below 8.0."
+fi
+if [[ "${GPU_CC_MAJOR}" -ge 12 ]]; then
+  INSTALL_FLASH_ATTN="0"
+  echo "Skipping flash-attn on ${GPU_CC_RAW}; use sdpa unless you have a known-good build."
+fi
+
+if [[ "${INSTALL_FLASH_ATTN}" == "1" ]] && python -c "import torch; import sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
   if python -m pip install --upgrade flash-attn --no-build-isolation --no-clean; then
     echo "flash-attn installed."
   else
@@ -59,7 +85,7 @@ if python -c "import torch; import sys; sys.exit(0 if torch.cuda.is_available() 
     echo "You can still run the app; it will use sdpa attention by default."
   fi
 else
-  echo "Torch CUDA is unavailable; skipping flash-attn."
+  echo "Torch CUDA is unavailable or flash-attn was skipped."
 fi
 
 cat <<'EOF'

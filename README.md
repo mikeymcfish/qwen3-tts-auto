@@ -57,6 +57,7 @@ python audiobook_qwen3.py \
 - `--output`: final combined WAV file.
 - `--resume-state`: continue from an existing `session_state.json`.
 - `--attn-implementation`: attention backend (`sdpa` default, `flash_attention_2` optional).
+- `--dtype`: model precision (`float16` default for broad GPU compatibility).
 - `--no-defrag-ui`: fallback to plain logs.
 
 ## Early Stop + Continue
@@ -80,3 +81,34 @@ Run the generated continue script to finish remaining text.
 - Default attention is `sdpa` for reliability. If `flash-attn` is installed, you can use `--attn-implementation flash_attention_2`.
 - This project follows Qwen3-TTS API patterns from the official repository:
   - https://github.com/QwenLM/Qwen3-TTS
+
+## Troubleshooting (RunPod)
+
+If you see:
+- `CUDA error: no kernel image is available for execution on the device`
+
+Then your GPU architecture is likely not supported by the currently installed PyTorch CUDA wheel.
+
+Try:
+
+```bash
+python - <<'PY'
+import torch
+print("torch:", torch.__version__, "cuda:", torch.version.cuda)
+print("gpu:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
+print("capability:", torch.cuda.get_device_capability(0) if torch.cuda.is_available() else "n/a")
+print("arches:", torch.cuda.get_arch_list() if torch.cuda.is_available() else "n/a")
+PY
+```
+
+If your GPU capability is missing from `arches`, reinstall torch with a newer index URL:
+
+```bash
+python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
+And run with safe settings:
+
+```bash
+python audiobook_qwen3.py ... --dtype float16 --attn-implementation sdpa
+```

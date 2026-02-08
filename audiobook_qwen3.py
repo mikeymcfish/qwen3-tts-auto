@@ -25,6 +25,7 @@ DEFAULT_OUTPUT_NAME = "audiobook.wav"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_PAUSE_MS = 300
 DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
+DEFAULT_DTYPE = "float16"
 
 
 @dataclass
@@ -437,6 +438,66 @@ def choose_attention_implementation(requested: str) -> tuple[str, str | None]:
     )
 
 
+def choose_dtype(torch: Any, requested: str, device: str) -> tuple[str, str | None]:
+    device_lower = device.lower()
+    if device_lower.startswith("cpu"):
+        if requested != "float32":
+            return "float32", "CPU mode is active; falling back dtype to float32."
+        return requested, None
+
+    if not device_lower.startswith("cuda"):
+        return requested, None
+
+    if requested != "bfloat16":
+        return requested, None
+
+    bf16_supported = False
+    try:
+        if hasattr(torch.cuda, "is_bf16_supported"):
+            bf16_supported = bool(torch.cuda.is_bf16_supported())
+    except Exception:
+        bf16_supported = False
+
+    if bf16_supported:
+        return requested, None
+    return (
+        "float16",
+        "bfloat16 requested but this GPU does not report bf16 support; falling back to float16.",
+    )
+
+
+def check_cuda_arch_compatibility(torch: Any, device: str) -> str | None:
+    device_lower = device.lower()
+    if not device_lower.startswith("cuda"):
+        return None
+    if not torch.cuda.is_available():
+        return (
+            "CUDA device was requested but torch.cuda.is_available() is False. "
+            "Install CUDA-enabled PyTorch or use --device cpu."
+        )
+
+    try:
+        index = 0
+        if ":" in device:
+            index = int(device.split(":", 1)[1])
+        cap_major, cap_minor = torch.cuda.get_device_capability(index)
+        device_name = torch.cuda.get_device_name(index)
+        target_arch = f"sm_{cap_major}{cap_minor}"
+        supported_arches = list(torch.cuda.get_arch_list())
+    except Exception:
+        return None
+
+    if target_arch in supported_arches:
+        return None
+
+    return (
+        "PyTorch CUDA build likely does not include kernels for your GPU "
+        f"({device_name}, {target_arch}). Installed arches: {supported_arches}. "
+        "On RunPod, reinstall torch with a newer CUDA index URL (for example cu128) "
+        "or choose a pod GPU architecture supported by this torch build."
+    )
+
+
 def combine_parts_with_pause(
     sf: Any,
     np: Any,
@@ -558,7 +619,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         choices=("float16", "bfloat16", "float32"),
-        default="bfloat16",
+        default=DEFAULT_DTYPE,
         help="Model dtype.",
     )
     parser.add_argument(
@@ -679,7 +740,7 @@ def main() -> int:
     )
     dtype_name = (
         str(state["dtype"])
-        if is_resume and args.dtype == "bfloat16" and state.get("dtype")
+        if is_resume and args.dtype == DEFAULT_DTYPE and state.get("dtype")
         else args.dtype
     )
     attn = (
@@ -734,6 +795,16 @@ def main() -> int:
 
     try:
         np, sf, torch, Qwen3TTSModel = require_runtime_dependencies()
+        arch_issue = check_cuda_arch_compatibility(torch, device)
+        if arch_issue:
+            raise RuntimeError(arch_issue)
+
+        dtype_name, dtype_warning = choose_dtype(torch, dtype_name, device)
+        if dtype_warning:
+            progress.set_status(dtype_warning)
+            if args.no_defrag_ui:
+                print(f"WARNING: {dtype_warning}")
+
         attn, attn_warning = choose_attention_implementation(attn)
         if attn_warning:
             progress.set_status(attn_warning)
@@ -933,8 +1004,15 @@ def main() -> int:
         print(f"State: {state_path}")
         return 0
     except Exception as exc:
+        error_text = str(exc)
+        if "no kernel image is available for execution on the device" in error_text:
+            error_text += (
+                " | likely GPU/torch CUDA architecture mismatch. "
+                "Try: (1) reinstall newer torch CUDA wheels (e.g. cu128 on RunPod), "
+                "(2) use --dtype float16, (3) use --attn-implementation sdpa."
+            )
         progress.stop(f"Failed: {exc}")
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {error_text}", file=sys.stderr)
         return 1
 
 
