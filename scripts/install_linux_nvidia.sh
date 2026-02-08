@@ -87,7 +87,7 @@ if [[ "${GPU_CC_MAJOR}" -lt 8 ]]; then
 fi
 if [[ "${GPU_CC_MAJOR}" -ge 12 ]]; then
   INSTALL_FLASH_ATTN="0"
-  echo "Skipping flash-attn on ${GPU_CC_RAW}; use eager unless you have a known-good build."
+  echo "Skipping flash-attn on ${GPU_CC_RAW}; use sdpa unless you have a known-good build."
 fi
 
 if [[ "${INSTALL_FLASH_ATTN}" == "1" ]] && python -c "import torch; import sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
@@ -95,7 +95,7 @@ if [[ "${INSTALL_FLASH_ATTN}" == "1" ]] && python -c "import torch; import sys; 
     echo "flash-attn installed."
   else
     echo "flash-attn installation failed; continuing without it."
-    echo "You can still run the app; it will use eager attention by default."
+    echo "You can still run the app; it will use sdpa attention by default."
   fi
 else
   echo "Torch CUDA is unavailable or flash-attn was skipped."
