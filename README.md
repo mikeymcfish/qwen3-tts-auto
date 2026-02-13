@@ -70,7 +70,7 @@ python audiobook_qwen3.py \
 - `--resume-state`: continue from an existing `session_state.json`.
 - `--attn-implementation`: attention backend (`sdpa` default, `flash_attention_2` optional).
 - `--dtype`: model precision (`bfloat16` default, auto-fallback to `float16` if unsupported).
-- `--no-defrag-ui`: fallback to plain logs.
+- `--no-defrag-ui`: disable defrag UI and print detailed text status/progress logs.
 
 ## Early Stop + Continue
 

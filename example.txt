@@ -7,8 +7,8 @@ python audiobook_qwen3.py \
   --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base 
 
   python audiobook_qwen3.py \
-  --text-file test.txt \
-  --reference-audio GrahamVerchere.mp3 \
+  --text-file TheNineties.txt \
   --dtype float16 \
   --attn-implementation flash_attention_2 \
-  --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base
+  --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --no-defrag-ui

@@ -64,6 +64,29 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def format_plain_progress(
+    completed_batches: int,
+    total_batches: int,
+    completed_chars: int,
+    total_chars: int,
+    elapsed_seconds: float,
+    average_batch_seconds: float,
+) -> str:
+    safe_total_batches = max(1, total_batches)
+    safe_total_chars = max(1, total_chars)
+    batch_pct = (max(0, completed_batches) / safe_total_batches) * 100.0
+    char_pct = (max(0, completed_chars) / safe_total_chars) * 100.0
+    remaining_batches = max(0, safe_total_batches - max(0, completed_batches))
+    eta_seconds = max(0.0, average_batch_seconds * remaining_batches)
+    return (
+        "progress: "
+        f"batches {completed_batches}/{safe_total_batches} ({batch_pct:5.1f}%), "
+        f"chars {completed_chars}/{safe_total_chars} ({char_pct:5.1f}%), "
+        f"elapsed {format_duration(elapsed_seconds)}, "
+        f"eta {format_duration(eta_seconds)}"
+    )
+
+
 def read_text_file(path: Path) -> str:
     encodings = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
     for encoding in encodings:
@@ -1035,7 +1058,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-defrag-ui",
         action="store_true",
-        help="Disable defrag-style progress UI.",
+        help="Disable defrag-style UI and print detailed text status/progress logs.",
     )
     parser.add_argument(
         "--stop-after-batch",
@@ -1301,34 +1324,64 @@ def main() -> int:
         batch_char_counts=all_batch_chars_for_view,
     )
     progress.start()
+    run_started_at = time.time()
+    plain_last_status = ""
+    plain_batch_durations: list[float] = []
+
+    def emit_status(message: str, warning: bool = False) -> None:
+        nonlocal plain_last_status
+        status_text = f"WARNING: {message}" if warning else message
+        progress.set_status(status_text)
+        if args.no_defrag_ui and status_text != plain_last_status:
+            print(f"status: {status_text}")
+            plain_last_status = status_text
+
+    def emit_progress(context: str | None = None) -> None:
+        if not args.no_defrag_ui:
+            return
+        completed_batches_total = existing_batches + completed_this_run
+        average_batch_seconds = (
+            sum(plain_batch_durations) / len(plain_batch_durations)
+            if plain_batch_durations
+            else 0.0
+        )
+        line = format_plain_progress(
+            completed_batches=completed_batches_total,
+            total_batches=total_batches,
+            completed_chars=completed_chars_total,
+            total_chars=total_chars,
+            elapsed_seconds=time.time() - run_started_at,
+            average_batch_seconds=average_batch_seconds,
+        )
+        if context:
+            line += f" | {context}"
+        print(line)
 
     try:
         np, sf, torch, Qwen3TTSModel = require_runtime_dependencies()
+        completed_this_run = 0
+        completed_chars_total = existing_chars
+        if args.no_defrag_ui:
+            print("status: Detailed text progress mode is active (--no-defrag-ui).")
+            emit_progress("starting run")
+
         sox_warning = check_sox_installation()
         if sox_warning:
-            progress.set_status(sox_warning)
-            if args.no_defrag_ui:
-                print(f"WARNING: {sox_warning}")
+            emit_status(sox_warning, warning=True)
 
         arch_fatal, arch_message = check_cuda_arch_compatibility(torch, device)
         if arch_message:
-            progress.set_status(arch_message)
-            if args.no_defrag_ui:
-                print(f"WARNING: {arch_message}")
+            emit_status(arch_message, warning=True)
         if arch_fatal and arch_message:
             raise RuntimeError(arch_message)
 
         dtype_name, dtype_warning = choose_dtype(torch, dtype_name, device)
         if dtype_warning:
-            progress.set_status(dtype_warning)
-            if args.no_defrag_ui:
-                print(f"WARNING: {dtype_warning}")
+            emit_status(dtype_warning, warning=True)
 
         attn, attn_warning = choose_attention_implementation(attn)
         if attn_warning:
-            progress.set_status(attn_warning)
-            if args.no_defrag_ui:
-                print(f"WARNING: {attn_warning}")
+            emit_status(attn_warning, warning=True)
         dtype_map = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
@@ -1347,9 +1400,7 @@ def main() -> int:
                     f"Model load failed with attn '{attn}', retrying with 'sdpa'. "
                     f"Reason: {model_exc}"
                 )
-                progress.set_status(fallback_msg)
-                if args.no_defrag_ui:
-                    print(f"WARNING: {fallback_msg}")
+                emit_status(fallback_msg, warning=True)
                 attn = "sdpa"
                 model = Qwen3TTSModel.from_pretrained(
                     model_id,
@@ -1359,7 +1410,7 @@ def main() -> int:
                 )
             else:
                 raise
-        progress.set_status("Building clone prompt...")
+        emit_status("Building clone prompt...")
         clone_prompt = model.create_voice_clone_prompt(
             ref_audio=reference_audio,
             ref_text=reference_text if reference_text else None,
@@ -1403,8 +1454,6 @@ def main() -> int:
         )
         save_state(state_path, state)
 
-        completed_this_run = 0
-        completed_chars_total = existing_chars
         runtime_options = {
             "reference_audio": reference_audio,
             "reference_text_file": reference_text_file,
@@ -1439,7 +1488,8 @@ def main() -> int:
                 active_batch_count=1,
             )
             if args.no_defrag_ui:
-                print(f"{batch_label}: generating...")
+                emit_status(f"Generating {batch_label}...")
+                emit_progress(f"started {batch_label}")
 
             started = time.time()
             kwargs: dict[str, Any] = {
@@ -1466,14 +1516,14 @@ def main() -> int:
                             stop_message_shown = True
                             progress.mark_stop_requested()
                             if args.no_defrag_ui:
-                                print(
+                                emit_status(
                                     "Stop requested; finishing current batch (Ctrl+C again to try abort)."
                                 )
                         if stop_controller.abort_current_batch and not abort_message_shown:
                             abort_message_shown = True
                             progress.mark_abort_requested()
                             if args.no_defrag_ui:
-                                print(
+                                emit_status(
                                     "Abort requested; attempting to cancel current batch..."
                                 )
                             cancel_succeeded = future.cancel()
@@ -1486,9 +1536,10 @@ def main() -> int:
                 progress.mark_batch_aborted(canceled=True)
                 stop_controller.request_stop()
                 if args.no_defrag_ui:
-                    print(
+                    emit_status(
                         f"Batch {global_batch}: canceled before execution; will remain in continue file."
                     )
+                    emit_progress(f"batch {global_batch} canceled")
                 break
 
             if not wavs:
@@ -1498,9 +1549,10 @@ def main() -> int:
                 progress.mark_batch_aborted(canceled=False)
                 stop_controller.request_stop()
                 if args.no_defrag_ui:
-                    print(
+                    emit_status(
                         f"Batch {global_batch}: could not be interrupted; output discarded so it remains in continue file."
                     )
+                    emit_progress(f"batch {global_batch} discarded for resume")
                 break
 
             duration = time.time() - started
@@ -1511,9 +1563,11 @@ def main() -> int:
             completed_this_run += 1
             completed_chars_total += batch.char_count
             state_batch_chars.append(batch.char_count)
+            plain_batch_durations.append(duration)
             progress.mark_batch_complete(batch.char_count, duration)
             if args.no_defrag_ui:
-                print(f"Batch {global_batch}: complete in {duration:.1f}s")
+                emit_status(f"Batch {global_batch}: complete in {duration:.1f}s")
+                emit_progress(f"completed batch {global_batch}")
 
             state["part_files"] = part_files
             state["batch_char_counts"] = state_batch_chars
@@ -1527,6 +1581,8 @@ def main() -> int:
                 stop_controller.request_stop()
             if stop_controller.stop_requested:
                 progress.mark_stop_requested()
+                if args.no_defrag_ui:
+                    emit_status("Stop requested; exiting after current batch.")
                 break
 
         combined_wav_path = (
@@ -1534,7 +1590,9 @@ def main() -> int:
             if output_suffix == ".wav"
             else run_dir / "audiobook_combined_intermediate.wav"
         )
-        progress.set_status("Combining audio parts with pauses...")
+        emit_status("Combining audio parts with pauses...")
+        if args.no_defrag_ui:
+            emit_progress("combining parts")
         sample_rate_out, duration_out = combine_parts_with_pause(
             sf=sf,
             np=np,
@@ -1543,7 +1601,7 @@ def main() -> int:
             pause_ms=pause_ms,
         )
         if output_suffix == ".mp3":
-            progress.set_status("Encoding high-quality MP3...")
+            emit_status("Encoding high-quality MP3...")
             convert_wav_to_mp3(
                 input_wav=combined_wav_path,
                 output_mp3=output_target,
