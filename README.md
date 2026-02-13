@@ -47,7 +47,6 @@ This installer:
 python audiobook_qwen3.py \
   --text-file /path/book.txt \
   --reference-audio /path/voice_ref.wav \
-  --reference-text-file /path/voice_ref_transcript.txt \
   --output /path/book_audiobook.mp3 \
   --max-chars-per-batch 1800 \
   --pause-ms 300 \
@@ -59,6 +58,7 @@ python audiobook_qwen3.py \
 - `--text-file`: input text file.
 - `--reference-audio`: reference audio for cloning.
 - `--reference-text` or `--reference-text-file`: transcript for reference audio.
+- If transcript args are omitted, the app auto-looks for `/path/to/<reference-audio-basename>.txt`.
 - `--x-vector-only-mode`: allow cloning without transcript.
 - `--max-chars-per-batch`: batch size control in characters.
 - `--pause-ms`: silence inserted between batch outputs.

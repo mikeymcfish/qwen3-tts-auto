@@ -68,6 +68,21 @@ def write_text_file(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8", newline="\n")
 
 
+def find_matching_reference_text_file(reference_audio: str) -> Path | None:
+    if not reference_audio:
+        return None
+    try:
+        audio_path = Path(reference_audio).expanduser()
+    except Exception:
+        return None
+    if not audio_path.exists() or not audio_path.is_file():
+        return None
+    transcript_path = audio_path.with_suffix(".txt")
+    if transcript_path.exists() and transcript_path.is_file():
+        return transcript_path.resolve()
+    return None
+
+
 def split_into_paragraphs(raw_text: str) -> list[str]:
     normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
@@ -851,7 +866,12 @@ def parse_args() -> argparse.Namespace:
         "--reference-text", type=str, help="Transcript for the reference audio."
     )
     ref_group.add_argument(
-        "--reference-text-file", type=Path, help="Path to transcript text file."
+        "--reference-text-file",
+        type=Path,
+        help=(
+            "Path to transcript text file. If omitted, the app will try "
+            "to use <reference-audio-basename>.txt from the same folder."
+        ),
     )
     parser.add_argument(
         "--x-vector-only-mode",
@@ -1009,6 +1029,16 @@ def main() -> int:
         print("ERROR: --reference-audio is required.", file=sys.stderr)
         return 2
 
+    auto_reference_text_file = find_matching_reference_text_file(reference_audio)
+    auto_reference_text_path_hint = ""
+    if not auto_reference_text_file:
+        try:
+            auto_reference_text_path_hint = str(
+                Path(reference_audio).expanduser().with_suffix(".txt")
+            )
+        except Exception:
+            auto_reference_text_path_hint = ""
+
     if args.reference_text_file:
         reference_text = read_text_file(args.reference_text_file.resolve()).strip()
     elif args.reference_text:
@@ -1017,13 +1047,21 @@ def main() -> int:
         reference_text = str(state["reference_text"]).strip()
     elif state.get("reference_text_file"):
         reference_text = read_text_file(Path(state["reference_text_file"]).resolve()).strip()
+    elif auto_reference_text_file:
+        reference_text = read_text_file(auto_reference_text_file).strip()
     else:
         reference_text = ""
 
     x_vector_only_mode = bool(args.x_vector_only_mode or state.get("x_vector_only_mode"))
     if not x_vector_only_mode and not reference_text:
+        auto_hint = (
+            f" (also looked for auto transcript: {auto_reference_text_path_hint})"
+            if auto_reference_text_path_hint
+            else ""
+        )
         print(
-            "ERROR: reference transcript is required (or set --x-vector-only-mode).",
+            "ERROR: reference transcript is required (or set --x-vector-only-mode)."
+            + auto_hint,
             file=sys.stderr,
         )
         return 2
