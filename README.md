@@ -57,6 +57,7 @@ python audiobook_qwen3.py \
 
 - `--text-file`: input text file.
 - `--reference-audio`: reference audio for cloning.
+- If `--reference-audio` is omitted in interactive mode, the app scans the text file's folder for audio files that have matching `.txt` transcripts and prompts you to pick one.
 - `--reference-text` or `--reference-text-file`: transcript for reference audio.
 - If transcript args are omitted, the app auto-looks for `/path/to/<reference-audio-basename>.txt`.
 - `--x-vector-only-mode`: allow cloning without transcript.

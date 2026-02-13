@@ -20,8 +20,9 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import TextIOBase
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 APP_VERSION = "0.1.0"
 DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
@@ -31,6 +32,16 @@ DEFAULT_PAUSE_MS = 300
 DEFAULT_MAX_INFERENCE_CHARS = 2600
 DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
 DEFAULT_DTYPE = "bfloat16"
+REFERENCE_AUDIO_EXTENSIONS = {
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".webm",
+}
 
 
 @dataclass
@@ -81,6 +92,62 @@ def find_matching_reference_text_file(reference_audio: str) -> Path | None:
     if transcript_path.exists() and transcript_path.is_file():
         return transcript_path.resolve()
     return None
+
+
+def scan_reference_audio_candidates(scan_dir: Path) -> list[tuple[Path, Path]]:
+    if not scan_dir.exists() or not scan_dir.is_dir():
+        return []
+    candidates: list[tuple[Path, Path]] = []
+    for path in sorted(scan_dir.iterdir(), key=lambda item: item.name.lower()):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in REFERENCE_AUDIO_EXTENSIONS:
+            continue
+        transcript_path = path.with_suffix(".txt")
+        if not transcript_path.exists() or not transcript_path.is_file():
+            continue
+        candidates.append((path.resolve(), transcript_path.resolve()))
+    return candidates
+
+
+def prompt_for_reference_audio_selection(
+    candidates: list[tuple[Path, Path]],
+    scan_dir: Path,
+    input_fn: Callable[[str], str] = input,
+    output_stream: TextIOBase | Any = sys.stdout,
+) -> Path | None:
+    if not candidates:
+        return None
+    print("", file=output_stream)
+    print("No --reference-audio was provided.", file=output_stream)
+    print(
+        f"Found {len(candidates)} audio files with matching .txt transcripts in:",
+        file=output_stream,
+    )
+    print(f"  {scan_dir}", file=output_stream)
+    for idx, (audio_path, transcript_path) in enumerate(candidates, start=1):
+        print(
+            f"  {idx}. {audio_path.name} (transcript: {transcript_path.name})",
+            file=output_stream,
+        )
+
+    while True:
+        try:
+            raw_choice = input_fn(
+                "Select a reference audio number (or 'q' to cancel): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if raw_choice.lower() in {"q", "quit", "exit"}:
+            return None
+        if raw_choice.isdigit():
+            idx = int(raw_choice)
+            if 1 <= idx <= len(candidates):
+                return candidates[idx - 1][0]
+        print(
+            f"Invalid selection. Enter a number between 1 and {len(candidates)}, or 'q'.",
+            file=output_stream,
+        )
 
 
 def split_into_paragraphs(raw_text: str) -> list[str]:
@@ -859,7 +926,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reference-audio",
         type=str,
-        help="Reference audio for voice clone (local path, URL, base64, etc.).",
+        help=(
+            "Reference audio for voice clone (local path, URL, base64, etc.). "
+            "If omitted in interactive mode, the app can prompt from files in the text-file folder."
+        ),
     )
     ref_group = parser.add_mutually_exclusive_group(required=False)
     ref_group.add_argument(
@@ -1026,8 +1096,33 @@ def main() -> int:
 
     reference_audio = args.reference_audio or state.get("reference_audio")
     if not reference_audio:
-        print("ERROR: --reference-audio is required.", file=sys.stderr)
-        return 2
+        scan_dir = text_file.parent.resolve()
+        candidates = scan_reference_audio_candidates(scan_dir)
+        if not candidates:
+            print(
+                "ERROR: --reference-audio is required. "
+                "No audio files with matching .txt transcripts were found in "
+                f"{scan_dir}.",
+                file=sys.stderr,
+            )
+            return 2
+        if not sys.stdin.isatty():
+            print(
+                "ERROR: --reference-audio is required in non-interactive mode. "
+                f"Found {len(candidates)} candidate(s) in {scan_dir}; "
+                "pass --reference-audio explicitly.",
+                file=sys.stderr,
+            )
+            return 2
+        selected_audio = prompt_for_reference_audio_selection(
+            candidates=candidates,
+            scan_dir=scan_dir,
+        )
+        if not selected_audio:
+            print("ERROR: No reference audio selected.", file=sys.stderr)
+            return 2
+        reference_audio = str(selected_audio)
+        print(f"Selected reference audio: {reference_audio}")
 
     auto_reference_text_file = find_matching_reference_text_file(reference_audio)
     auto_reference_text_path_hint = ""
