@@ -4,5 +4,12 @@ python audiobook_qwen3.py \
   --reference-text-file griffin_3s.txt \
   --dtype float16 \
   --attn-implementation flash_attention_2 \
-  --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-  --no-defrag-ui
+  --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base 
+
+  python audiobook_qwen3.py \
+  --text-file speech.txt \
+  --reference-audio frankie.mp3 \
+  --reference-text-file frankie.txt \
+  --dtype float16 \
+  --attn-implementation flash_attention_2 \
+  --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base
