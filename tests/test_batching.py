@@ -1,6 +1,10 @@
 import unittest
 
-from audiobook_qwen3 import build_batches, split_into_paragraphs
+from audiobook_qwen3 import (
+    build_batches,
+    extract_chapter_titles_from_raw_text,
+    split_into_paragraphs,
+)
 
 
 class BatchingTests(unittest.TestCase):
@@ -16,6 +20,13 @@ class BatchingTests(unittest.TestCase):
         self.assertEqual(
             split_into_paragraphs(text),
             ["Para one", "[BREAK]", "para two", "[CHAPTER]", "Para three"],
+        )
+
+    def test_extract_chapter_titles_from_raw_text(self) -> None:
+        text = "Intro\n[CHAPTER]\nTitle One\nBody\n[chapter]\n  Title Two  \nTail"
+        self.assertEqual(
+            extract_chapter_titles_from_raw_text(text),
+            ["Title One", "Title Two"],
         )
 
     def test_batches_only_break_between_paragraphs(self) -> None:
@@ -60,11 +71,16 @@ class BatchingTests(unittest.TestCase):
 
     def test_chapter_tag_forces_break_and_marks_next_batch(self) -> None:
         paragraphs = ["First block.", "[CHAPTER]", "Second block."]
-        batches = build_batches(paragraphs, max_chars_per_batch=200)
+        batches = build_batches(
+            paragraphs,
+            max_chars_per_batch=200,
+            chapter_titles=["Second block."],
+        )
         self.assertEqual(len(batches), 2)
         self.assertFalse(batches[0].starts_chapter)
         self.assertTrue(batches[1].starts_chapter)
         self.assertTrue(batches[1].forced_break_before)
+        self.assertEqual(batches[1].chapter_title, "Second block.")
 
 
 if __name__ == "__main__":

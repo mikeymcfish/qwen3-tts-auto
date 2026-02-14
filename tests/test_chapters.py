@@ -3,6 +3,7 @@ import unittest
 from audiobook_qwen3 import (
     build_batch_boundary_types,
     build_ffmetadata_with_chapters,
+    chapter_time_entries_from_batches,
     chapter_start_times_from_batches,
     compute_inter_batch_pause_samples,
 )
@@ -50,9 +51,17 @@ class ChapterMetadataTests(unittest.TestCase):
         )
         self.assertEqual(chapter_times, [0.0, 2.0])
 
+    def test_chapter_time_entries_include_batch_numbers(self) -> None:
+        chapter_entries = chapter_time_entries_from_batches(
+            chapter_batch_numbers=[2, 4],
+            part_start_samples=[0, 1000, 2500, 4000],
+            sample_rate=1000,
+        )
+        self.assertEqual(chapter_entries, [(1.0, 2), (4.0, 4)])
+
     def test_ffmetadata_contains_chapter_blocks(self) -> None:
         metadata = build_ffmetadata_with_chapters(
-            chapter_start_times=[0.0, 10.5],
+            chapter_entries=[(0.0, "Prologue"), (10.5, None)],
             total_duration_seconds=20.0,
         )
         self.assertIn(";FFMETADATA1", metadata)
@@ -60,7 +69,7 @@ class ChapterMetadataTests(unittest.TestCase):
         self.assertIn("END=10500", metadata)
         self.assertIn("START=10500", metadata)
         self.assertIn("END=20000", metadata)
-        self.assertIn("title=Chapter 1", metadata)
+        self.assertIn("title=Prologue", metadata)
         self.assertIn("title=Chapter 2", metadata)
 
 

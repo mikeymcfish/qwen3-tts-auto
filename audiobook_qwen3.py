@@ -56,6 +56,7 @@ class TextBatch:
     char_count: int
     starts_chapter: bool = False
     forced_break_before: bool = False
+    chapter_title: str | None = None
 
 
 def now_iso() -> str:
@@ -197,6 +198,22 @@ def split_into_paragraphs(raw_text: str) -> list[str]:
     return paragraphs
 
 
+def extract_chapter_titles_from_raw_text(raw_text: str) -> list[str]:
+    normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+    chapter_pattern = re.compile(r"(?i)\[CHAPTER\]")
+    titles: list[str] = []
+    for line_index, line in enumerate(lines):
+        matches = chapter_pattern.findall(line)
+        if not matches:
+            continue
+        next_line = lines[line_index + 1] if line_index + 1 < len(lines) else ""
+        title = re.sub(r"[ \t]+", " ", next_line.strip())
+        for _ in matches:
+            titles.append(title)
+    return titles
+
+
 def split_into_sentences(paragraph: str) -> list[str]:
     stripped = paragraph.strip()
     if not stripped:
@@ -292,7 +309,11 @@ def build_batch_boundary_types(
     return boundary_types
 
 
-def build_batches(paragraphs: list[str], max_chars_per_batch: int) -> list[TextBatch]:
+def build_batches(
+    paragraphs: list[str],
+    max_chars_per_batch: int,
+    chapter_titles: list[str] | None = None,
+) -> list[TextBatch]:
     if max_chars_per_batch < 100:
         raise ValueError("--max-chars-per-batch must be at least 100.")
 
@@ -302,11 +323,14 @@ def build_batches(paragraphs: list[str], max_chars_per_batch: int) -> list[TextB
     end_idx = 0
     current_starts_chapter = False
     current_forced_break_before = False
+    current_chapter_title: str | None = None
     pending_chapter = False
     pending_forced_break = False
+    pending_chapter_title: str | None = None
+    chapter_title_index = 0
 
     def flush() -> None:
-        nonlocal current_text, start_idx, end_idx, current_starts_chapter, current_forced_break_before
+        nonlocal current_text, start_idx, end_idx, current_starts_chapter, current_forced_break_before, current_chapter_title
         if not current_text:
             return
         batches.append(
@@ -318,6 +342,7 @@ def build_batches(paragraphs: list[str], max_chars_per_batch: int) -> list[TextB
                 char_count=len(current_text),
                 starts_chapter=current_starts_chapter,
                 forced_break_before=current_forced_break_before,
+                chapter_title=current_chapter_title,
             )
         )
         current_text = ""
@@ -325,6 +350,7 @@ def build_batches(paragraphs: list[str], max_chars_per_batch: int) -> list[TextB
         end_idx = 0
         current_starts_chapter = False
         current_forced_break_before = False
+        current_chapter_title = None
 
     for idx, paragraph in enumerate(paragraphs):
         control = parse_control_tag(paragraph)
@@ -336,6 +362,12 @@ def build_batches(paragraphs: list[str], max_chars_per_batch: int) -> list[TextB
             flush()
             pending_chapter = True
             pending_forced_break = True
+            if chapter_titles and chapter_title_index < len(chapter_titles):
+                candidate_title = str(chapter_titles[chapter_title_index]).strip()
+                pending_chapter_title = candidate_title if candidate_title else None
+            else:
+                pending_chapter_title = None
+            chapter_title_index += 1
             continue
 
         paragraph_chunks = split_paragraph_for_batches(paragraph, max_chars_per_batch)
@@ -354,8 +386,10 @@ def build_batches(paragraphs: list[str], max_chars_per_batch: int) -> list[TextB
                 current_text = chunk
                 current_starts_chapter = pending_chapter
                 current_forced_break_before = pending_forced_break
+                current_chapter_title = pending_chapter_title
                 pending_chapter = False
                 pending_forced_break = False
+                pending_chapter_title = None
                 continue
 
             current_text += separator + chunk
@@ -1105,14 +1139,14 @@ def compute_inter_batch_pause_samples(
     return gap
 
 
-def chapter_start_times_from_batches(
+def chapter_time_entries_from_batches(
     chapter_batch_numbers: list[int],
     part_start_samples: list[int],
     sample_rate: int,
-) -> list[float]:
+) -> list[tuple[float, int]]:
     if sample_rate <= 0:
         return []
-    chapter_times: list[float] = []
+    chapter_entries: list[tuple[float, int]] = []
     seen_starts: set[int] = set()
     for batch_number in chapter_batch_numbers:
         index = batch_number - 1
@@ -1122,42 +1156,81 @@ def chapter_start_times_from_batches(
         if start_sample in seen_starts:
             continue
         seen_starts.add(start_sample)
-        chapter_times.append(start_sample / float(sample_rate))
-    return sorted(chapter_times)
+        chapter_entries.append((start_sample / float(sample_rate), batch_number))
+    return sorted(chapter_entries, key=lambda item: item[0])
+
+
+def chapter_start_times_from_batches(
+    chapter_batch_numbers: list[int],
+    part_start_samples: list[int],
+    sample_rate: int,
+) -> list[float]:
+    return [
+        start_seconds
+        for start_seconds, _batch_number in chapter_time_entries_from_batches(
+            chapter_batch_numbers=chapter_batch_numbers,
+            part_start_samples=part_start_samples,
+            sample_rate=sample_rate,
+        )
+    ]
+
+
+def sanitize_chapter_title(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = re.sub(r"[ \t]+", " ", str(value).strip())
+    return normalized if normalized else None
+
+
+def escape_ffmetadata_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\")
+    escaped = escaped.replace("\n", " ").replace("\r", " ")
+    escaped = escaped.replace(";", r"\;").replace("#", r"\#").replace("=", r"\=")
+    return escaped
 
 
 def build_ffmetadata_with_chapters(
-    chapter_start_times: list[float],
+    chapter_entries: list[tuple[float, str | None]],
     total_duration_seconds: float,
 ) -> str:
     total_ms = max(0, int(round(total_duration_seconds * 1000.0)))
-    chapter_starts_ms = sorted(
-        {
-            max(0, int(round(start_seconds * 1000.0)))
-            for start_seconds in chapter_start_times
-            if start_seconds >= 0.0
-        }
-    )
-    chapter_starts_ms = [start_ms for start_ms in chapter_starts_ms if start_ms < total_ms]
+    normalized_entries: list[tuple[int, str | None]] = []
+    for start_seconds, title in chapter_entries:
+        if start_seconds < 0.0:
+            continue
+        start_ms = max(0, int(round(start_seconds * 1000.0)))
+        if start_ms >= total_ms:
+            continue
+        normalized_entries.append((start_ms, sanitize_chapter_title(title)))
+
+    normalized_entries.sort(key=lambda item: item[0])
+    deduped_entries: list[tuple[int, str | None]] = []
+    seen_starts_ms: set[int] = set()
+    for start_ms, title in normalized_entries:
+        if start_ms in seen_starts_ms:
+            continue
+        seen_starts_ms.add(start_ms)
+        deduped_entries.append((start_ms, title))
 
     lines = [";FFMETADATA1"]
-    if not chapter_starts_ms:
+    if not deduped_entries:
         return "\n".join(lines) + "\n"
 
-    for index, start_ms in enumerate(chapter_starts_ms, start=1):
+    for index, (start_ms, custom_title) in enumerate(deduped_entries, start=1):
         next_start_ms = (
-            chapter_starts_ms[index]
-            if index < len(chapter_starts_ms)
+            deduped_entries[index][0]
+            if index < len(deduped_entries)
             else max(start_ms + 1, total_ms)
         )
         end_ms = max(start_ms + 1, next_start_ms)
+        title = custom_title if custom_title else f"Chapter {index}"
         lines.extend(
             [
                 "[CHAPTER]",
                 "TIMEBASE=1/1000",
                 f"START={start_ms}",
                 f"END={end_ms}",
-                f"title=Chapter {index}",
+                f"title={escape_ffmetadata_value(title)}",
             ]
         )
     return "\n".join(lines) + "\n"
@@ -1593,11 +1666,17 @@ def main() -> int:
         if candidate.exists():
             reference_text_file = candidate
 
-    paragraphs = split_into_paragraphs(read_text_file(text_file))
+    source_text = read_text_file(text_file)
+    chapter_titles_from_text = extract_chapter_titles_from_raw_text(source_text)
+    paragraphs = split_into_paragraphs(source_text)
     if not paragraphs:
         print(f"ERROR: no usable paragraphs found in {text_file}.", file=sys.stderr)
         return 2
-    batches = build_batches(paragraphs, max_chars)
+    batches = build_batches(
+        paragraphs,
+        max_chars,
+        chapter_titles=chapter_titles_from_text,
+    )
 
     part_files: list[str] = list(state.get("part_files", []))
     for existing_part in resolve_paths(run_dir, part_files):
@@ -1621,6 +1700,21 @@ def main() -> int:
                 continue
             state_chapter_batches.append(batch_number)
             seen_saved_chapters.add(batch_number)
+    raw_saved_chapter_titles = state.get("chapter_titles_by_batch", {})
+    state_chapter_titles: dict[int, str] = {}
+    if isinstance(raw_saved_chapter_titles, dict):
+        for key, value in raw_saved_chapter_titles.items():
+            try:
+                batch_number = int(key)
+            except (TypeError, ValueError):
+                continue
+            if batch_number < 1 or batch_number > existing_batches:
+                continue
+            if batch_number not in seen_saved_chapters:
+                continue
+            title = sanitize_chapter_title(str(value))
+            if title:
+                state_chapter_titles[batch_number] = title
 
     existing_chars = int(state.get("completed_characters", 0))
     total_batches = existing_batches + len(batches)
@@ -1788,6 +1882,10 @@ def main() -> int:
                 "part_files": part_files,
                 "batch_char_counts": state_batch_chars,
                 "chapter_batch_numbers": state_chapter_batches,
+                "chapter_titles_by_batch": {
+                    str(batch_number): title
+                    for batch_number, title in sorted(state_chapter_titles.items())
+                },
                 "completed_batches": existing_batches,
                 "completed_characters": existing_chars,
                 "stopped_early": False,
@@ -1911,6 +2009,9 @@ def main() -> int:
             state_batch_chars.append(batch.char_count)
             if batch.starts_chapter:
                 state_chapter_batches.append(global_batch)
+                chapter_title = sanitize_chapter_title(batch.chapter_title)
+                if chapter_title:
+                    state_chapter_titles[global_batch] = chapter_title
             plain_batch_durations.append(duration)
             progress.mark_batch_complete(batch.char_count, duration)
             if args.no_defrag_ui:
@@ -1920,6 +2021,10 @@ def main() -> int:
             state["part_files"] = part_files
             state["batch_char_counts"] = state_batch_chars
             state["chapter_batch_numbers"] = state_chapter_batches
+            state["chapter_titles_by_batch"] = {
+                str(batch_number): title
+                for batch_number, title in sorted(state_chapter_titles.items())
+            }
             state["completed_batches"] = len(part_files)
             state["completed_characters"] = completed_chars_total
             state["sample_rate"] = int(sample_rate)
@@ -1954,13 +2059,20 @@ def main() -> int:
         if output_suffix == ".mp3":
             chapter_metadata_path: Path | None = None
             if use_chapters:
-                chapter_times = chapter_start_times_from_batches(
+                chapter_time_entries = chapter_time_entries_from_batches(
                     chapter_batch_numbers=state_chapter_batches,
                     part_start_samples=part_start_samples,
                     sample_rate=sample_rate_out,
                 )
+                chapter_entries_for_metadata: list[tuple[float, str | None]] = [
+                    (
+                        start_seconds,
+                        state_chapter_titles.get(batch_number),
+                    )
+                    for start_seconds, batch_number in chapter_time_entries
+                ]
                 metadata_text = build_ffmetadata_with_chapters(
-                    chapter_start_times=chapter_times,
+                    chapter_entries=chapter_entries_for_metadata,
                     total_duration_seconds=duration_out,
                 )
                 if "[CHAPTER]" in metadata_text:
