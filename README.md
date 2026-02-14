@@ -21,7 +21,7 @@ Simple CLI app that turns a `.txt` file into an audiobook with Qwen3-TTS voice c
   - white: completed
   - gray marker: chapter break
   - black marker: natural batch break
-- Cooler animated terminal style with scan beam + pulse effects.
+- Includes a Gradio web UI (`gradio_app.py`) for interactive runs.
 - Graceful stop controls:
   - `Ctrl+C` once: stop after current batch
   - `Ctrl+C` twice: attempt to cancel current batch; if not interruptible, output is discarded and batch is kept for resume
@@ -59,6 +59,22 @@ python audiobook_qwen3.py \
   --pause-ms 300 \
   --language Auto
 ```
+
+## Gradio UI
+
+```bash
+python gradio_app.py
+```
+
+Then open:
+
+- `http://127.0.0.1:7860`
+
+Optional environment variables:
+
+- `GRADIO_SERVER_NAME` (default: `127.0.0.1`)
+- `GRADIO_SERVER_PORT` (default: `7860`)
+- `GRADIO_SHARE` (`1/true` to enable public share links)
 
 ## Important Arguments
 
