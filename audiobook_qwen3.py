@@ -203,14 +203,15 @@ def extract_chapter_titles_from_raw_text(raw_text: str) -> list[str]:
     lines = normalized.split("\n")
     chapter_pattern = re.compile(r"(?i)\[CHAPTER\]")
     titles: list[str] = []
-    for line_index, line in enumerate(lines):
-        matches = chapter_pattern.findall(line)
+    for line in lines:
+        matches = list(chapter_pattern.finditer(line))
         if not matches:
             continue
-        next_line = lines[line_index + 1] if line_index + 1 < len(lines) else ""
-        title = re.sub(r"[ \t]+", " ", next_line.strip())
-        for _ in matches:
-            titles.append(title)
+        for idx, match in enumerate(matches):
+            title_start = match.end()
+            title_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(line)
+            title_text = re.sub(r"[ \t]+", " ", line[title_start:title_end].strip())
+            titles.append(title_text)
     return titles
 
 
@@ -785,7 +786,11 @@ def create_continue_assets(
     remaining_segments: list[str] = []
     for batch in remaining_batches:
         if batch.starts_chapter:
-            remaining_segments.append(CHAPTER_TAG)
+            chapter_title = sanitize_chapter_title(batch.chapter_title)
+            if chapter_title:
+                remaining_segments.append(f"{CHAPTER_TAG} {chapter_title}")
+            else:
+                remaining_segments.append(CHAPTER_TAG)
         elif batch.forced_break_before:
             remaining_segments.append(BREAK_TAG)
         remaining_segments.append(batch.text)

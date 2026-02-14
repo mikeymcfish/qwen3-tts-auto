@@ -103,7 +103,7 @@ You can place these tags anywhere in your input `.txt`:
 
 - `[BREAK]`: forces a hard batch split at that point.
 - `[CHAPTER]`: forces a hard batch split and marks the next spoken batch as a chapter start.
-  - When `--use-chapters` is enabled, the metadata chapter title is taken from the line immediately after the tag.
+  - When `--use-chapters` is enabled, the metadata chapter title is taken from text on the same line immediately after the tag (if any).
 
 Use `--use-chapters` to write those chapter starts into final MP3 chapter metadata.
 Chapter times are computed from actual combined audio, including configured `--pause-ms` and `--chapter-pause-ms`, so they align with playback.

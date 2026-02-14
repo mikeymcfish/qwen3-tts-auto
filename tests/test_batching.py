@@ -23,10 +23,17 @@ class BatchingTests(unittest.TestCase):
         )
 
     def test_extract_chapter_titles_from_raw_text(self) -> None:
-        text = "Intro\n[CHAPTER]\nTitle One\nBody\n[chapter]\n  Title Two  \nTail"
+        text = (
+            "Intro\n"
+            "[CHAPTER] Title One\n"
+            "Body\n"
+            "[chapter]   Title Two  \n"
+            "[CHAPTER]\n"
+            "[CHAPTER] Final Title"
+        )
         self.assertEqual(
             extract_chapter_titles_from_raw_text(text),
-            ["Title One", "Title Two"],
+            ["Title One", "Title Two", "", "Final Title"],
         )
 
     def test_batches_only_break_between_paragraphs(self) -> None:
