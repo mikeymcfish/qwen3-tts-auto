@@ -7,7 +7,7 @@ python audiobook_qwen3.py \
   --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base 
 
   python audiobook_qwen3.py \
-  --text-file TheNineties.txt \
+  --text-file RefugeRecovery.txt \
   --dtype float16 \
   --attn-implementation flash_attention_2 \
   --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base \

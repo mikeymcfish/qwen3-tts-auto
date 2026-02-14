@@ -42,6 +42,8 @@ REFERENCE_AUDIO_EXTENSIONS = {
     ".opus",
     ".webm",
 }
+BREAK_TAG = "[BREAK]"
+CHAPTER_TAG = "[CHAPTER]"
 
 
 @dataclass
@@ -51,6 +53,8 @@ class TextBatch:
     end_paragraph: int
     text: str
     char_count: int
+    starts_chapter: bool = False
+    forced_break_before: bool = False
 
 
 def now_iso() -> str:
@@ -177,6 +181,11 @@ def split_into_paragraphs(raw_text: str) -> list[str]:
     normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
         return []
+    normalized = re.sub(
+        r"(?i)\[(BREAK|CHAPTER)\]",
+        lambda match: f"\n\n[{match.group(1).upper()}]\n\n",
+        normalized,
+    )
     chunks = re.split(r"\n\s*\n+", normalized)
     paragraphs: list[str] = []
     for chunk in chunks:
@@ -187,45 +196,153 @@ def split_into_paragraphs(raw_text: str) -> list[str]:
     return paragraphs
 
 
+def split_into_sentences(paragraph: str) -> list[str]:
+    stripped = paragraph.strip()
+    if not stripped:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", stripped)
+    sentences = [part.strip() for part in parts if part.strip()]
+    return sentences if sentences else [stripped]
+
+
+def split_text_to_fit(text: str, max_chars: int) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    words = text.split(" ")
+    current_words: list[str] = []
+    current_len = 0
+    for word in words:
+        if not word:
+            continue
+        add_len = len(word) if not current_words else len(word) + 1
+        if current_words and current_len + add_len > max_chars:
+            chunks.append(" ".join(current_words))
+            current_words = [word]
+            current_len = len(word)
+            continue
+        current_words.append(word)
+        current_len += add_len
+    if current_words:
+        chunks.append(" ".join(current_words))
+    if not chunks:
+        chunks = [text]
+
+    bounded: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            bounded.append(chunk)
+            continue
+        start = 0
+        while start < len(chunk):
+            bounded.append(chunk[start : start + max_chars])
+            start += max_chars
+    return bounded
+
+
+def split_paragraph_for_batches(paragraph: str, max_chars: int) -> list[str]:
+    sentences = split_into_sentences(paragraph)
+    if not sentences:
+        return []
+
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        sentence_parts = split_text_to_fit(sentence, max_chars)
+        for part in sentence_parts:
+            if not current:
+                current = part
+                continue
+            if len(current) + 1 + len(part) <= max_chars:
+                current = f"{current} {part}"
+                continue
+            chunks.append(current)
+            current = part
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def parse_control_tag(paragraph: str) -> str | None:
+    token = paragraph.strip().upper()
+    if token == BREAK_TAG:
+        return "break"
+    if token == CHAPTER_TAG:
+        return "chapter"
+    return None
+
+
 def build_batches(paragraphs: list[str], max_chars_per_batch: int) -> list[TextBatch]:
     if max_chars_per_batch < 100:
         raise ValueError("--max-chars-per-batch must be at least 100.")
 
     batches: list[TextBatch] = []
-    current: list[str] = []
+    current_text = ""
     start_idx = 0
-    current_len = 0
+    end_idx = 0
+    current_starts_chapter = False
+    current_forced_break_before = False
+    pending_chapter = False
+    pending_forced_break = False
 
-    def flush(end_idx: int) -> None:
-        nonlocal current, start_idx, current_len
-        if not current:
+    def flush() -> None:
+        nonlocal current_text, start_idx, end_idx, current_starts_chapter, current_forced_break_before
+        if not current_text:
             return
-        text = "\n\n".join(current)
         batches.append(
             TextBatch(
                 index=len(batches) + 1,
                 start_paragraph=start_idx,
                 end_paragraph=end_idx,
-                text=text,
-                char_count=len(text),
+                text=current_text,
+                char_count=len(current_text),
+                starts_chapter=current_starts_chapter,
+                forced_break_before=current_forced_break_before,
             )
         )
-        current = []
-        current_len = 0
+        current_text = ""
+        start_idx = 0
+        end_idx = 0
+        current_starts_chapter = False
+        current_forced_break_before = False
 
     for idx, paragraph in enumerate(paragraphs):
-        add_len = len(paragraph) if not current else len(paragraph) + 2
-        if current and current_len + add_len > max_chars_per_batch:
-            flush(idx - 1)
-        if not current:
-            start_idx = idx
-            current.append(paragraph)
-            current_len = len(paragraph)
+        control = parse_control_tag(paragraph)
+        if control == "break":
+            flush()
+            pending_forced_break = True
             continue
-        current.append(paragraph)
-        current_len += add_len
+        if control == "chapter":
+            flush()
+            pending_chapter = True
+            pending_forced_break = True
+            continue
 
-    flush(len(paragraphs) - 1)
+        paragraph_chunks = split_paragraph_for_batches(paragraph, max_chars_per_batch)
+        for chunk_index, chunk in enumerate(paragraph_chunks):
+            separator = ""
+            if current_text:
+                separator = "\n\n" if chunk_index == 0 else " "
+            add_len = len(separator) + len(chunk)
+            if current_text and len(current_text) + add_len > max_chars_per_batch:
+                flush()
+                separator = ""
+
+            if not current_text:
+                start_idx = idx
+                end_idx = idx
+                current_text = chunk
+                current_starts_chapter = pending_chapter
+                current_forced_break_before = pending_forced_break
+                pending_chapter = False
+                pending_forced_break = False
+                continue
+
+            current_text += separator + chunk
+            end_idx = idx
+
+    flush()
     return batches
 
 
@@ -596,7 +713,14 @@ def create_continue_assets(
     runtime_options: dict[str, Any],
 ) -> dict[str, str]:
     remaining_text_path = run_dir / f"continue_from_batch_{next_batch_number:05d}.txt"
-    remaining_text = "\n\n".join(batch.text for batch in remaining_batches).strip() + "\n"
+    remaining_segments: list[str] = []
+    for batch in remaining_batches:
+        if batch.starts_chapter:
+            remaining_segments.append(CHAPTER_TAG)
+        elif batch.forced_break_before:
+            remaining_segments.append(BREAK_TAG)
+        remaining_segments.append(batch.text)
+    remaining_text = "\n\n".join(remaining_segments).strip() + "\n"
     write_text_file(remaining_text_path, remaining_text)
 
     command_args = [
@@ -635,6 +759,8 @@ def create_continue_assets(
         )
     if runtime_options.get("x_vector_only_mode"):
         command_args.append("--x-vector-only-mode")
+    if runtime_options.get("use_chapters"):
+        command_args.append("--use-chapters")
     if runtime_options.get("no_defrag_ui"):
         command_args.append("--no-defrag-ui")
 
@@ -866,7 +992,7 @@ def combine_parts_with_pause(
     part_paths: list[Path],
     output_wav_path: Path,
     pause_ms: int,
-) -> tuple[int, float]:
+) -> tuple[int, float, list[int]]:
     if not part_paths:
         raise RuntimeError("No audio parts exist to combine.")
 
@@ -877,6 +1003,7 @@ def combine_parts_with_pause(
 
     output_wav_path.parent.mkdir(parents=True, exist_ok=True)
     total_samples = 0
+    part_start_samples: list[int] = []
     with sf.SoundFile(
         str(output_wav_path),
         mode="w",
@@ -884,6 +1011,7 @@ def combine_parts_with_pause(
         channels=channels,
         subtype="PCM_16",
     ) as writer:
+        part_start_samples.append(total_samples)
         writer.write(first_audio.astype(np.float32))
         total_samples += first_audio.shape[0]
         for part_path in part_paths[1:]:
@@ -904,13 +1032,77 @@ def combine_parts_with_pause(
             if pause_samples > 0:
                 writer.write(silence)
                 total_samples += pause_samples
+            part_start_samples.append(total_samples)
             writer.write(audio.astype(np.float32))
             total_samples += audio.shape[0]
     duration_seconds = total_samples / float(sample_rate)
-    return int(sample_rate), float(duration_seconds)
+    return int(sample_rate), float(duration_seconds), part_start_samples
 
 
-def convert_wav_to_mp3(input_wav: Path, output_mp3: Path, quality_level: int) -> None:
+def chapter_start_times_from_batches(
+    chapter_batch_numbers: list[int],
+    part_start_samples: list[int],
+    sample_rate: int,
+) -> list[float]:
+    if sample_rate <= 0:
+        return []
+    chapter_times: list[float] = []
+    seen_starts: set[int] = set()
+    for batch_number in chapter_batch_numbers:
+        index = batch_number - 1
+        if index < 0 or index >= len(part_start_samples):
+            continue
+        start_sample = part_start_samples[index]
+        if start_sample in seen_starts:
+            continue
+        seen_starts.add(start_sample)
+        chapter_times.append(start_sample / float(sample_rate))
+    return sorted(chapter_times)
+
+
+def build_ffmetadata_with_chapters(
+    chapter_start_times: list[float],
+    total_duration_seconds: float,
+) -> str:
+    total_ms = max(0, int(round(total_duration_seconds * 1000.0)))
+    chapter_starts_ms = sorted(
+        {
+            max(0, int(round(start_seconds * 1000.0)))
+            for start_seconds in chapter_start_times
+            if start_seconds >= 0.0
+        }
+    )
+    chapter_starts_ms = [start_ms for start_ms in chapter_starts_ms if start_ms < total_ms]
+
+    lines = [";FFMETADATA1"]
+    if not chapter_starts_ms:
+        return "\n".join(lines) + "\n"
+
+    for index, start_ms in enumerate(chapter_starts_ms, start=1):
+        next_start_ms = (
+            chapter_starts_ms[index]
+            if index < len(chapter_starts_ms)
+            else max(start_ms + 1, total_ms)
+        )
+        end_ms = max(start_ms + 1, next_start_ms)
+        lines.extend(
+            [
+                "[CHAPTER]",
+                "TIMEBASE=1/1000",
+                f"START={start_ms}",
+                f"END={end_ms}",
+                f"title=Chapter {index}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def convert_wav_to_mp3(
+    input_wav: Path,
+    output_mp3: Path,
+    quality_level: int,
+    chapter_metadata_path: Path | None = None,
+) -> None:
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
         raise RuntimeError(
@@ -925,13 +1117,34 @@ def convert_wav_to_mp3(input_wav: Path, output_mp3: Path, quality_level: int) ->
         "error",
         "-i",
         str(input_wav),
-        "-vn",
-        "-codec:a",
-        "libmp3lame",
-        "-q:a",
-        str(quality_level),
-        str(output_mp3),
     ]
+    if chapter_metadata_path:
+        cmd.extend(
+            [
+                "-f",
+                "ffmetadata",
+                "-i",
+                str(chapter_metadata_path),
+                "-map_metadata",
+                "1",
+                "-map_chapters",
+                "1",
+                "-id3v2_version",
+                "3",
+            ]
+        )
+    cmd.extend(
+        [
+            "-map",
+            "0:a",
+            "-vn",
+            "-codec:a",
+            "libmp3lame",
+            "-q:a",
+            str(quality_level),
+            str(output_mp3),
+        ]
+    )
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
@@ -1059,6 +1272,14 @@ def parse_args() -> argparse.Namespace:
         "--no-defrag-ui",
         action="store_true",
         help="Disable defrag-style UI and print detailed text status/progress logs.",
+    )
+    parser.add_argument(
+        "--use-chapters",
+        action="store_true",
+        help=(
+            f"Use {CHAPTER_TAG} markers as MP3 chapters and embed chapter metadata "
+            "into the final .mp3 output."
+        ),
     )
     parser.add_argument(
         "--stop-after-batch",
@@ -1206,6 +1427,7 @@ def main() -> int:
         if is_resume and args.mp3_quality == 0 and state.get("mp3_quality") is not None
         else args.mp3_quality
     )
+    use_chapters = bool(args.use_chapters or state.get("use_chapters"))
     inference_batch_size = (
         int(state["inference_batch_size"])
         if is_resume
@@ -1271,6 +1493,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if use_chapters and output_suffix != ".mp3":
+        print(
+            "WARNING: --use-chapters was requested, but chapter metadata is only embedded for .mp3 output.",
+            file=sys.stderr,
+        )
 
     reference_text_file: Path | None = None
     if reference_text:
@@ -1294,6 +1521,22 @@ def main() -> int:
             return 2
 
     existing_batches = len(part_files)
+    raw_saved_chapter_batches = state.get("chapter_batch_numbers", [])
+    state_chapter_batches: list[int] = []
+    seen_saved_chapters: set[int] = set()
+    if isinstance(raw_saved_chapter_batches, list):
+        for value in raw_saved_chapter_batches:
+            try:
+                batch_number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if batch_number < 1 or batch_number > existing_batches:
+                continue
+            if batch_number in seen_saved_chapters:
+                continue
+            state_chapter_batches.append(batch_number)
+            seen_saved_chapters.add(batch_number)
+
     existing_chars = int(state.get("completed_characters", 0))
     total_batches = existing_batches + len(batches)
     total_chars = existing_chars + sum(batch.char_count for batch in batches)
@@ -1440,10 +1683,12 @@ def main() -> int:
                 "max_chars_per_batch": max_chars,
                 "pause_ms": pause_ms,
                 "mp3_quality": mp3_quality,
+                "use_chapters": use_chapters,
                 "inference_batch_size": inference_batch_size,
                 "max_inference_chars": max_inference_chars,
                 "part_files": part_files,
                 "batch_char_counts": state_batch_chars,
+                "chapter_batch_numbers": state_chapter_batches,
                 "completed_batches": existing_batches,
                 "completed_characters": existing_chars,
                 "stopped_early": False,
@@ -1461,6 +1706,7 @@ def main() -> int:
             "max_chars_per_batch": max_chars,
             "pause_ms": pause_ms,
             "mp3_quality": mp3_quality,
+            "use_chapters": use_chapters,
             "inference_batch_size": inference_batch_size,
             "max_inference_chars": max_inference_chars,
             "language": language,
@@ -1563,6 +1809,8 @@ def main() -> int:
             completed_this_run += 1
             completed_chars_total += batch.char_count
             state_batch_chars.append(batch.char_count)
+            if batch.starts_chapter:
+                state_chapter_batches.append(global_batch)
             plain_batch_durations.append(duration)
             progress.mark_batch_complete(batch.char_count, duration)
             if args.no_defrag_ui:
@@ -1571,6 +1819,7 @@ def main() -> int:
 
             state["part_files"] = part_files
             state["batch_char_counts"] = state_batch_chars
+            state["chapter_batch_numbers"] = state_chapter_batches
             state["completed_batches"] = len(part_files)
             state["completed_characters"] = completed_chars_total
             state["sample_rate"] = int(sample_rate)
@@ -1593,7 +1842,7 @@ def main() -> int:
         emit_status("Combining audio parts with pauses...")
         if args.no_defrag_ui:
             emit_progress("combining parts")
-        sample_rate_out, duration_out = combine_parts_with_pause(
+        sample_rate_out, duration_out, part_start_samples = combine_parts_with_pause(
             sf=sf,
             np=np,
             part_paths=resolve_paths(run_dir, part_files),
@@ -1601,11 +1850,26 @@ def main() -> int:
             pause_ms=pause_ms,
         )
         if output_suffix == ".mp3":
+            chapter_metadata_path: Path | None = None
+            if use_chapters:
+                chapter_times = chapter_start_times_from_batches(
+                    chapter_batch_numbers=state_chapter_batches,
+                    part_start_samples=part_start_samples,
+                    sample_rate=sample_rate_out,
+                )
+                metadata_text = build_ffmetadata_with_chapters(
+                    chapter_start_times=chapter_times,
+                    total_duration_seconds=duration_out,
+                )
+                if "[CHAPTER]" in metadata_text:
+                    chapter_metadata_path = run_dir / "chapters.ffmeta"
+                    write_text_file(chapter_metadata_path, metadata_text)
             emit_status("Encoding high-quality MP3...")
             convert_wav_to_mp3(
                 input_wav=combined_wav_path,
                 output_mp3=output_target,
                 quality_level=mp3_quality,
+                chapter_metadata_path=chapter_metadata_path,
             )
             if combined_wav_path.exists():
                 try:

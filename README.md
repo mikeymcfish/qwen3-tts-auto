@@ -7,7 +7,11 @@ Simple CLI app that turns a `.txt` file into an audiobook with Qwen3-TTS voice c
 - Uses Qwen3-TTS voice cloning (`create_voice_clone_prompt` + `generate_voice_clone`).
 - Splits text into paragraph-aware batches.
 - Combines short paragraphs until `--max-chars-per-batch` is reached.
-- Batch boundaries only happen between paragraphs.
+- Keeps paragraph boundaries by default, but splits oversized paragraphs at sentence endings.
+- Supports control tags in text:
+  - `[BREAK]`: force a batch boundary
+  - `[CHAPTER]`: force a batch boundary and mark a chapter start
+- Optional MP3 chapter embedding with `--use-chapters` (based on `[CHAPTER]` tags).
 - Combines all generated parts with pause spacing, then outputs high-quality MP3 by default.
 - Defrag-style live progress UI where each batch uses one block per 200 chars:
   - red: pending
@@ -64,6 +68,7 @@ python audiobook_qwen3.py \
 - `--max-chars-per-batch`: batch size control in characters.
 - `--pause-ms`: silence inserted between batch outputs.
 - `--mp3-quality`: MP3 VBR quality for final encode (`0` best, `9` smallest).
+- `--use-chapters`: embed MP3 chapter metadata from `[CHAPTER]` markers.
 - `--inference-batch-size`: compatibility option; batched mode is disabled and forced to `1`.
 - `--max-inference-chars`: compatibility option retained for old scripts; ignored.
 - `--output`: final path (`.mp3` recommended, `.wav` supported).
@@ -71,6 +76,16 @@ python audiobook_qwen3.py \
 - `--attn-implementation`: attention backend (`sdpa` default, `flash_attention_2` optional).
 - `--dtype`: model precision (`bfloat16` default, auto-fallback to `float16` if unsupported).
 - `--no-defrag-ui`: disable defrag UI and print detailed text status/progress logs.
+
+## Text Control Tags
+
+You can place these tags anywhere in your input `.txt`:
+
+- `[BREAK]`: forces a hard batch split at that point.
+- `[CHAPTER]`: forces a hard batch split and marks the next spoken batch as a chapter start.
+
+Use `--use-chapters` to write those chapter starts into final MP3 chapter metadata.
+Chapter times are computed from actual combined audio, including configured `--pause-ms`, so they align with playback.
 
 ## Early Stop + Continue
 
