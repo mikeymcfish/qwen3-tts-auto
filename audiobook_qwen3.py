@@ -29,6 +29,7 @@ DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 DEFAULT_OUTPUT_NAME = "audiobook.mp3"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_PAUSE_MS = 300
+DEFAULT_CHAPTER_PAUSE_MS = 0
 DEFAULT_MAX_INFERENCE_CHARS = 2600
 DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
 DEFAULT_DTYPE = "bfloat16"
@@ -273,6 +274,24 @@ def parse_control_tag(paragraph: str) -> str | None:
     return None
 
 
+def build_batch_boundary_types(
+    total_batches: int, chapter_batch_numbers: list[int] | None = None
+) -> list[str]:
+    count = max(1, int(total_batches))
+    chapter_numbers: set[int] = set()
+    for value in chapter_batch_numbers or []:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number >= 1:
+            chapter_numbers.add(number)
+    boundary_types: list[str] = ["none"]
+    for batch_number in range(2, count + 1):
+        boundary_types.append("chapter" if batch_number in chapter_numbers else "natural")
+    return boundary_types
+
+
 def build_batches(paragraphs: list[str], max_chars_per_batch: int) -> list[TextBatch]:
     if max_chars_per_batch < 100:
         raise ValueError("--max-chars-per-batch must be at least 100.")
@@ -407,11 +426,14 @@ class DefragProgressView:
     COLOR_YELLOW = "\x1b[93m"
     COLOR_MAGENTA = "\x1b[95m"
     COLOR_DIM = "\x1b[90m"
+    COLOR_BLACK = "\x1b[30m"
     GLYPH_PENDING = "\u25a0"
     GLYPH_WORKING_A = "\u25a3"
     GLYPH_WORKING_B = "\u25a0"
     GLYPH_DONE = "\u25a0"
     GLYPH_COMPLETE = "\u25a0"
+    GLYPH_BREAK = "\u25a0"
+    GLYPH_CHAPTER = "\u25a0"
     GLYPH_EMPTY = "\u25a1"
     GLYPH_BEAM = "\u25c8"
 
@@ -423,6 +445,7 @@ class DefragProgressView:
         completed_chars: int,
         enabled: bool,
         batch_char_counts: list[int] | None = None,
+        batch_boundary_types: list[str] | None = None,
     ) -> None:
         self.total_batches = max(1, total_batches)
         self.total_chars = max(1, total_chars)
@@ -456,6 +479,15 @@ class DefragProgressView:
             max(1, (chars + self.CHARS_PER_BLOCK - 1) // self.CHARS_PER_BLOCK)
             for chars in self._batch_char_counts
         ]
+        if batch_boundary_types and len(batch_boundary_types) == self.total_batches:
+            normalized_boundary_types = [
+                value if value in {"none", "natural", "chapter"} else "natural"
+                for value in batch_boundary_types
+            ]
+            normalized_boundary_types[0] = "none"
+            self._batch_boundary_types = normalized_boundary_types
+        else:
+            self._batch_boundary_types = build_batch_boundary_types(self.total_batches)
 
     def start(self) -> None:
         if not self.enabled:
@@ -611,7 +643,6 @@ class DefragProgressView:
         lines: list[str] = []
         line_parts: list[str] = []
         visible_len = 0
-        separator = "  "
         for batch_number, block_count in enumerate(self._batch_block_counts, start=1):
             active_batch = active_start <= batch_number <= active_end
             if active_batch:
@@ -631,15 +662,30 @@ class DefragProgressView:
                 glyph = self.GLYPH_PENDING
 
             token = f"{color}{glyph * block_count}{self.COLOR_RESET}"
-            token_visible = block_count + len(separator)
+            token_visible = block_count
             if visible_len + token_visible > blocks_per_row and line_parts:
                 lines.append("".join(line_parts))
                 line_parts = []
                 visible_len = 0
-            line_parts.append(token + separator)
+            line_parts.append(token)
             visible_len += token_visible
+
+            if batch_number < self.total_batches:
+                boundary_kind = self._batch_boundary_types[batch_number]
+                if boundary_kind == "chapter":
+                    marker_token = (
+                        f"{self.COLOR_DIM}{self.GLYPH_CHAPTER}{self.COLOR_RESET}"
+                    )
+                else:
+                    marker_token = f"{self.COLOR_BLACK}{self.GLYPH_BREAK}{self.COLOR_RESET}"
+                if visible_len + 1 > blocks_per_row and line_parts:
+                    lines.append("".join(line_parts))
+                    line_parts = []
+                    visible_len = 0
+                line_parts.append(marker_token)
+                visible_len += 1
         if line_parts:
-            lines.append("".join(line_parts).rstrip())
+            lines.append("".join(line_parts))
         if not lines:
             lines.append("(no blocks)")
 
@@ -669,6 +715,8 @@ class DefragProgressView:
             f"{self.COLOR_BLUE}{self.GLYPH_WORKING_A}{self.COLOR_RESET}=working  "
             f"{self.COLOR_GREEN}{self.GLYPH_DONE}{self.COLOR_RESET}=done-now  "
             f"{self.COLOR_WHITE}{self.GLYPH_COMPLETE}{self.COLOR_RESET}=completed  "
+            f"{self.COLOR_DIM}{self.GLYPH_CHAPTER}{self.COLOR_RESET}=chapter  "
+            f"{self.COLOR_BLACK}{self.GLYPH_BREAK}{self.COLOR_RESET}=natural-break  "
             f"{self.COLOR_CYAN}{self.GLYPH_BEAM}{self.COLOR_RESET}=scan",
             "stop: requested (will exit after current batch)"
             if stop_requested
@@ -736,6 +784,8 @@ def create_continue_assets(
         str(runtime_options["max_chars_per_batch"]),
         "--pause-ms",
         str(runtime_options["pause_ms"]),
+        "--chapter-pause-ms",
+        str(runtime_options["chapter_pause_ms"]),
         "--mp3-quality",
         str(runtime_options["mp3_quality"]),
         "--inference-batch-size",
@@ -992,6 +1042,8 @@ def combine_parts_with_pause(
     part_paths: list[Path],
     output_wav_path: Path,
     pause_ms: int,
+    chapter_batch_numbers: list[int] | None = None,
+    chapter_pause_ms: int = 0,
 ) -> tuple[int, float, list[int]]:
     if not part_paths:
         raise RuntimeError("No audio parts exist to combine.")
@@ -999,7 +1051,15 @@ def combine_parts_with_pause(
     first_audio, sample_rate = sf.read(str(part_paths[0]), always_2d=True)
     channels = first_audio.shape[1]
     pause_samples = int(sample_rate * (max(0, pause_ms) / 1000.0))
-    silence = np.zeros((pause_samples, channels), dtype=np.float32)
+    chapter_pause_samples = int(sample_rate * (max(0, chapter_pause_ms) / 1000.0))
+    chapter_starts: set[int] = set()
+    for value in chapter_batch_numbers or []:
+        try:
+            batch_number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if batch_number >= 1:
+            chapter_starts.add(batch_number)
 
     output_wav_path.parent.mkdir(parents=True, exist_ok=True)
     total_samples = 0
@@ -1014,7 +1074,7 @@ def combine_parts_with_pause(
         part_start_samples.append(total_samples)
         writer.write(first_audio.astype(np.float32))
         total_samples += first_audio.shape[0]
-        for part_path in part_paths[1:]:
+        for batch_number, part_path in enumerate(part_paths[1:], start=2):
             audio, sr = sf.read(str(part_path), always_2d=True)
             if sr != sample_rate:
                 raise RuntimeError(
@@ -1029,14 +1089,33 @@ def combine_parts_with_pause(
                     raise RuntimeError(
                         f"Channel mismatch while combining parts: {part_path} ({audio.shape[1]} channels)."
                     )
-            if pause_samples > 0:
+            gap_samples = compute_inter_batch_pause_samples(
+                base_pause_samples=pause_samples,
+                chapter_pause_samples=chapter_pause_samples,
+                next_batch_number=batch_number,
+                chapter_batch_numbers=chapter_starts,
+            )
+            if gap_samples > 0:
+                silence = np.zeros((gap_samples, channels), dtype=np.float32)
                 writer.write(silence)
-                total_samples += pause_samples
+                total_samples += gap_samples
             part_start_samples.append(total_samples)
             writer.write(audio.astype(np.float32))
             total_samples += audio.shape[0]
     duration_seconds = total_samples / float(sample_rate)
     return int(sample_rate), float(duration_seconds), part_start_samples
+
+
+def compute_inter_batch_pause_samples(
+    base_pause_samples: int,
+    chapter_pause_samples: int,
+    next_batch_number: int,
+    chapter_batch_numbers: set[int],
+) -> int:
+    gap = max(0, int(base_pause_samples))
+    if int(next_batch_number) in chapter_batch_numbers:
+        gap += max(0, int(chapter_pause_samples))
+    return gap
 
 
 def chapter_start_times_from_batches(
@@ -1213,6 +1292,15 @@ def parse_args() -> argparse.Namespace:
         help=f"Pause between batch chunks in milliseconds (default: {DEFAULT_PAUSE_MS}).",
     )
     parser.add_argument(
+        "--chapter-pause-ms",
+        type=int,
+        default=DEFAULT_CHAPTER_PAUSE_MS,
+        help=(
+            "Additional pause inserted before chapter-start batches in milliseconds "
+            f"(default: {DEFAULT_CHAPTER_PAUSE_MS})."
+        ),
+    )
+    parser.add_argument(
         "--mp3-quality",
         type=int,
         default=0,
@@ -1299,6 +1387,9 @@ def main() -> int:
         return 2
     if args.pause_ms < 0:
         print("ERROR: --pause-ms cannot be negative.", file=sys.stderr)
+        return 2
+    if args.chapter_pause_ms < 0:
+        print("ERROR: --chapter-pause-ms cannot be negative.", file=sys.stderr)
         return 2
     if args.mp3_quality < 0 or args.mp3_quality > 9:
         print("ERROR: --mp3-quality must be between 0 and 9.", file=sys.stderr)
@@ -1421,6 +1512,13 @@ def main() -> int:
         int(state["pause_ms"])
         if is_resume and args.pause_ms == DEFAULT_PAUSE_MS and state.get("pause_ms")
         else args.pause_ms
+    )
+    chapter_pause_ms = (
+        int(state["chapter_pause_ms"])
+        if is_resume
+        and args.chapter_pause_ms == DEFAULT_CHAPTER_PAUSE_MS
+        and state.get("chapter_pause_ms") is not None
+        else args.chapter_pause_ms
     )
     mp3_quality = (
         int(state["mp3_quality"])
@@ -1557,6 +1655,18 @@ def main() -> int:
     new_batch_chars = [batch.char_count for batch in batches]
     all_batch_chars_for_view = saved_batch_chars + new_batch_chars
     state_batch_chars = list(saved_batch_chars)
+    new_chapter_batches_for_view = [
+        existing_batches + index
+        for index, batch in enumerate(batches, start=1)
+        if batch.starts_chapter
+    ]
+    all_chapter_batches_for_view = sorted(
+        set(state_chapter_batches + new_chapter_batches_for_view)
+    )
+    batch_boundary_types_for_view = build_batch_boundary_types(
+        total_batches=total_batches,
+        chapter_batch_numbers=all_chapter_batches_for_view,
+    )
 
     progress = DefragProgressView(
         total_batches=total_batches,
@@ -1565,6 +1675,7 @@ def main() -> int:
         completed_chars=existing_chars,
         enabled=not args.no_defrag_ui,
         batch_char_counts=all_batch_chars_for_view,
+        batch_boundary_types=batch_boundary_types_for_view,
     )
     progress.start()
     run_started_at = time.time()
@@ -1682,6 +1793,7 @@ def main() -> int:
                 "language": language,
                 "max_chars_per_batch": max_chars,
                 "pause_ms": pause_ms,
+                "chapter_pause_ms": chapter_pause_ms,
                 "mp3_quality": mp3_quality,
                 "use_chapters": use_chapters,
                 "inference_batch_size": inference_batch_size,
@@ -1705,6 +1817,7 @@ def main() -> int:
             "output_wav": output_target,
             "max_chars_per_batch": max_chars,
             "pause_ms": pause_ms,
+            "chapter_pause_ms": chapter_pause_ms,
             "mp3_quality": mp3_quality,
             "use_chapters": use_chapters,
             "inference_batch_size": inference_batch_size,
@@ -1848,6 +1961,8 @@ def main() -> int:
             part_paths=resolve_paths(run_dir, part_files),
             output_wav_path=combined_wav_path,
             pause_ms=pause_ms,
+            chapter_batch_numbers=state_chapter_batches,
+            chapter_pause_ms=chapter_pause_ms,
         )
         if output_suffix == ".mp3":
             chapter_metadata_path: Path | None = None

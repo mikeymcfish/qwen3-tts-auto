@@ -12,12 +12,15 @@ Simple CLI app that turns a `.txt` file into an audiobook with Qwen3-TTS voice c
   - `[BREAK]`: force a batch boundary
   - `[CHAPTER]`: force a batch boundary and mark a chapter start
 - Optional MP3 chapter embedding with `--use-chapters` (based on `[CHAPTER]` tags).
+- Supports extra silence before chapter starts via `--chapter-pause-ms`.
 - Combines all generated parts with pause spacing, then outputs high-quality MP3 by default.
 - Defrag-style live progress UI where each batch uses one block per 200 chars:
   - red: pending
   - blue: currently processing
   - green: just completed
   - white: completed
+  - gray marker: chapter break
+  - black marker: natural batch break
 - Cooler animated terminal style with scan beam + pulse effects.
 - Graceful stop controls:
   - `Ctrl+C` once: stop after current batch
@@ -67,6 +70,7 @@ python audiobook_qwen3.py \
 - `--x-vector-only-mode`: allow cloning without transcript.
 - `--max-chars-per-batch`: batch size control in characters.
 - `--pause-ms`: silence inserted between batch outputs.
+- `--chapter-pause-ms`: additional silence inserted before chapter-start batches.
 - `--mp3-quality`: MP3 VBR quality for final encode (`0` best, `9` smallest).
 - `--use-chapters`: embed MP3 chapter metadata from `[CHAPTER]` markers.
 - `--inference-batch-size`: compatibility option; batched mode is disabled and forced to `1`.
@@ -85,7 +89,7 @@ You can place these tags anywhere in your input `.txt`:
 - `[CHAPTER]`: forces a hard batch split and marks the next spoken batch as a chapter start.
 
 Use `--use-chapters` to write those chapter starts into final MP3 chapter metadata.
-Chapter times are computed from actual combined audio, including configured `--pause-ms`, so they align with playback.
+Chapter times are computed from actual combined audio, including configured `--pause-ms` and `--chapter-pause-ms`, so they align with playback.
 
 ## Early Stop + Continue
 

@@ -1,9 +1,39 @@
 import unittest
 
-from audiobook_qwen3 import build_ffmetadata_with_chapters, chapter_start_times_from_batches
+from audiobook_qwen3 import (
+    build_batch_boundary_types,
+    build_ffmetadata_with_chapters,
+    chapter_start_times_from_batches,
+    compute_inter_batch_pause_samples,
+)
 
 
 class ChapterMetadataTests(unittest.TestCase):
+    def test_build_batch_boundary_types_marks_chapters(self) -> None:
+        boundary_types = build_batch_boundary_types(5, [3, 5])
+        self.assertEqual(
+            boundary_types,
+            ["none", "natural", "chapter", "natural", "chapter"],
+        )
+
+    def test_compute_inter_batch_pause_samples_adds_chapter_pause(self) -> None:
+        gap = compute_inter_batch_pause_samples(
+            base_pause_samples=300,
+            chapter_pause_samples=900,
+            next_batch_number=4,
+            chapter_batch_numbers={2, 4},
+        )
+        self.assertEqual(gap, 1200)
+
+    def test_compute_inter_batch_pause_samples_without_chapter(self) -> None:
+        gap = compute_inter_batch_pause_samples(
+            base_pause_samples=300,
+            chapter_pause_samples=900,
+            next_batch_number=3,
+            chapter_batch_numbers={2, 4},
+        )
+        self.assertEqual(gap, 300)
+
     def test_chapter_start_times_map_batch_numbers(self) -> None:
         chapter_times = chapter_start_times_from_batches(
             chapter_batch_numbers=[1, 3],
