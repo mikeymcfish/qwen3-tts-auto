@@ -426,16 +426,16 @@ class DefragProgressView:
     COLOR_YELLOW = "\x1b[93m"
     COLOR_MAGENTA = "\x1b[95m"
     COLOR_DIM = "\x1b[90m"
+    COLOR_LIGHT_GRAY = "\x1b[37m"
     COLOR_BLACK = "\x1b[30m"
-    GLYPH_PENDING = "\u25a0"
-    GLYPH_WORKING_A = "\u25a3"
-    GLYPH_WORKING_B = "\u25a0"
-    GLYPH_DONE = "\u25a0"
-    GLYPH_COMPLETE = "\u25a0"
-    GLYPH_BREAK = "\u25a0"
-    GLYPH_CHAPTER = "\u25a0"
-    GLYPH_EMPTY = "\u25a1"
-    GLYPH_BEAM = "\u25c8"
+    GLYPH_PENDING = "\u25ae"
+    GLYPH_WORKING_A = "\u25ae"
+    GLYPH_WORKING_B = "\u25af"
+    GLYPH_DONE = "\u25ae"
+    GLYPH_COMPLETE = "\u25ae"
+    GLYPH_BREAK = "\u25ae"
+    GLYPH_CHAPTER = "\u25ae"
+    GLYPH_EMPTY = "\u25af"
 
     def __init__(
         self,
@@ -674,7 +674,7 @@ class DefragProgressView:
                 boundary_kind = self._batch_boundary_types[batch_number]
                 if boundary_kind == "chapter":
                     marker_token = (
-                        f"{self.COLOR_DIM}{self.GLYPH_CHAPTER}{self.COLOR_RESET}"
+                        f"{self.COLOR_LIGHT_GRAY}{self.GLYPH_CHAPTER}{self.COLOR_RESET}"
                     )
                 else:
                     marker_token = f"{self.COLOR_BLACK}{self.GLYPH_BREAK}{self.COLOR_RESET}"
@@ -689,17 +689,6 @@ class DefragProgressView:
         if not lines:
             lines.append("(no blocks)")
 
-        scan_bar_len = max(20, min(56, blocks_per_row // 2))
-        scan_pos = self._tick % scan_bar_len
-        scan_chars = [self.GLYPH_EMPTY] * scan_bar_len
-        scan_chars[scan_pos] = self.GLYPH_BEAM
-        if scan_pos + 1 < scan_bar_len:
-            scan_chars[scan_pos + 1] = self.GLYPH_BEAM
-        scanline = (
-            f"{self.COLOR_DIM}{''.join(scan_chars[:scan_pos])}{self.COLOR_RESET}"
-            f"{self.COLOR_CYAN}{''.join(scan_chars[scan_pos:scan_pos + 2])}{self.COLOR_RESET}"
-            f"{self.COLOR_DIM}{''.join(scan_chars[scan_pos + 2:])}{self.COLOR_RESET}"
-        )
         border = "=" * min(64, max(40, terminal_columns - 2))
 
         header = [
@@ -709,15 +698,13 @@ class DefragProgressView:
             f"elapsed {format_duration(elapsed)}  eta {format_duration(eta)}  throughput {throughput:7.1f} chars/s",
             f"current {current_batch_label}",
             f"blocks: {completed_blocks}/{total_blocks}  (1 block = {self.CHARS_PER_BLOCK} chars)  grid={blocks_per_row}/row",
-            f"scanline {scanline}",
             f"status: {self.COLOR_YELLOW}{status}{self.COLOR_RESET}",
             f"legend: {self.COLOR_RED}{self.GLYPH_PENDING}{self.COLOR_RESET}=pending  "
             f"{self.COLOR_BLUE}{self.GLYPH_WORKING_A}{self.COLOR_RESET}=working  "
             f"{self.COLOR_GREEN}{self.GLYPH_DONE}{self.COLOR_RESET}=done-now  "
             f"{self.COLOR_WHITE}{self.GLYPH_COMPLETE}{self.COLOR_RESET}=completed  "
-            f"{self.COLOR_DIM}{self.GLYPH_CHAPTER}{self.COLOR_RESET}=chapter  "
-            f"{self.COLOR_BLACK}{self.GLYPH_BREAK}{self.COLOR_RESET}=natural-break  "
-            f"{self.COLOR_CYAN}{self.GLYPH_BEAM}{self.COLOR_RESET}=scan",
+            f"{self.COLOR_LIGHT_GRAY}{self.GLYPH_CHAPTER}{self.COLOR_RESET}=chapter  "
+            f"{self.COLOR_BLACK}{self.GLYPH_BREAK}{self.COLOR_RESET}=natural-break",
             "stop: requested (will exit after current batch)"
             if stop_requested
             else "stop: running (Ctrl+C once stop-after-batch, twice try abort-current)",
