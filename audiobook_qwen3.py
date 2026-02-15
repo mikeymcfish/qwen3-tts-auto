@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Create audiobook files from text using Qwen3-TTS voice cloning.
+Create audiobook files from text using MOSS-TTS or Qwen3-TTS voice cloning.
 """
 
 from __future__ import annotations
@@ -25,12 +25,23 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 APP_VERSION = "0.1.0"
-DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+DEFAULT_TTS_BACKEND = "moss-delay"
+DEFAULT_MODEL_ID_BY_BACKEND = {
+    "moss-delay": "OpenMOSS-Team/MOSS-TTS",
+    "moss-local": "OpenMOSS-Team/MOSS-TTS-Local-Transformer",
+    "qwen": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+}
+DEFAULT_MODEL_ID = DEFAULT_MODEL_ID_BY_BACKEND[DEFAULT_TTS_BACKEND]
 DEFAULT_OUTPUT_NAME = "audiobook.mp3"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_PAUSE_MS = 300
 DEFAULT_CHAPTER_PAUSE_MS = 0
 DEFAULT_MAX_INFERENCE_CHARS = 2600
+DEFAULT_MAX_NEW_TOKENS = 4096
+DEFAULT_MOSS_AUDIO_TEMPERATURE = 1.7
+DEFAULT_MOSS_AUDIO_TOP_P = 0.8
+DEFAULT_MOSS_AUDIO_TOP_K = 25
+DEFAULT_MOSS_AUDIO_REPETITION_PENALTY = 1.0
 DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
 DEFAULT_DTYPE = "bfloat16"
 REFERENCE_AUDIO_EXTENSIONS = {
@@ -57,6 +68,150 @@ class TextBatch:
     starts_chapter: bool = False
     forced_break_before: bool = False
     chapter_title: str | None = None
+
+
+def normalize_tts_backend(value: str) -> str:
+    raw = (value or "").strip().lower()
+    aliases = {
+        "moss": "moss-delay",
+        "moss-tts": "moss-delay",
+        "delay": "moss-delay",
+        "moss-delay": "moss-delay",
+        "local": "moss-local",
+        "moss-local": "moss-local",
+        "moss-local-transformer": "moss-local",
+        "qwen3": "qwen",
+        "qwen": "qwen",
+        "auto": "auto",
+    }
+    return aliases.get(raw, raw)
+
+
+def infer_backend_from_model_id(model_id: str) -> str:
+    lowered = (model_id or "").strip().lower()
+    if "moss" in lowered:
+        if "local" in lowered:
+            return "moss-local"
+        return "moss-delay"
+    return "qwen"
+
+
+def resolve_tts_backend(requested_backend: str, model_id: str) -> str:
+    normalized = normalize_tts_backend(requested_backend)
+    if normalized == "auto":
+        return infer_backend_from_model_id(model_id)
+    if normalized not in {"qwen", "moss-delay", "moss-local"}:
+        raise ValueError(
+            f"Unsupported --tts-backend '{requested_backend}'. "
+            "Use one of: qwen, moss-delay, moss-local, auto."
+        )
+    return normalized
+
+
+def is_moss_backend(backend: str) -> bool:
+    return backend in {"moss-delay", "moss-local"}
+
+
+def recommended_default_model_id(backend: str) -> str:
+    return DEFAULT_MODEL_ID_BY_BACKEND.get(backend, DEFAULT_MODEL_ID)
+
+
+def parse_cuda_device_index(device: str) -> int:
+    if ":" not in device:
+        return 0
+    suffix = device.split(":", 1)[1]
+    if suffix.isdigit():
+        return int(suffix)
+    return 0
+
+
+def detect_cuda_total_memory_gb(torch: Any, device: str) -> float | None:
+    device_lower = (device or "").lower()
+    if not device_lower.startswith("cuda"):
+        return None
+    if not getattr(torch.cuda, "is_available", lambda: False)():
+        return None
+    try:
+        props = torch.cuda.get_device_properties(parse_cuda_device_index(device))
+        total_bytes = float(getattr(props, "total_memory", 0))
+    except Exception:
+        return None
+    if total_bytes <= 0:
+        return None
+    return total_bytes / float(1024**3)
+
+
+def choose_inference_batch_size(
+    requested: int,
+    backend: str,
+    torch: Any,
+    device: str,
+    max_chars_per_batch: int,
+) -> tuple[int, str | None]:
+    if backend == "qwen":
+        if requested > 1:
+            return (
+                1,
+                f"--inference-batch-size={requested} requested, but qwen backend is single-item only; forcing to 1.",
+            )
+        return (1, None)
+
+    if requested >= 1:
+        return (requested, None)
+
+    if not (device or "").lower().startswith("cuda"):
+        return (1, "Auto inference batch size selected 1 (non-CUDA device).")
+    if not torch.cuda.is_available():
+        return (1, "Auto inference batch size selected 1 (CUDA unavailable).")
+
+    memory_gb = detect_cuda_total_memory_gb(torch, device)
+    if memory_gb is None:
+        return (1, "Auto inference batch size selected 1 (unable to detect GPU memory).")
+
+    if backend == "moss-delay":
+        if memory_gb >= 48:
+            base = 4
+        elif memory_gb >= 32:
+            base = 3
+        elif memory_gb >= 24:
+            base = 2
+        else:
+            base = 1
+    else:
+        if memory_gb >= 48:
+            base = 8
+        elif memory_gb >= 24:
+            base = 6
+        elif memory_gb >= 16:
+            base = 4
+        elif memory_gb >= 12:
+            base = 2
+        else:
+            base = 1
+
+    if max_chars_per_batch >= 2600:
+        base = max(1, base - 1)
+    elif max_chars_per_batch <= 1200:
+        base = min(8, base + 1)
+
+    return (
+        base,
+        (
+            f"Auto inference batch size selected {base} for {backend} on "
+            f"GPU memory {memory_gb:.1f} GiB with max chars {max_chars_per_batch}."
+        ),
+    )
+
+
+def is_cuda_oom_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    indicators = (
+        "cuda out of memory",
+        "out of memory",
+        "cublas_status_alloc_failed",
+        "cuda error: out of memory",
+    )
+    return any(marker in text for marker in indicators)
 
 
 def now_iso() -> str:
@@ -728,7 +883,7 @@ class DefragProgressView:
 
         header = [
             f"{self.COLOR_CYAN}{border}{self.COLOR_RESET}",
-            f"{self.COLOR_MAGENTA}{spinner}{self.COLOR_RESET} Qwen3-TTS Defrag Animator",
+            f"{self.COLOR_MAGENTA}{spinner}{self.COLOR_RESET} TTS Defrag Animator",
             f"[{bar}] {percent:6.2f}%  batches {completed_batches}/{self.total_batches}  chars {completed_chars}/{self.total_chars}",
             f"elapsed {format_duration(elapsed)}  eta {format_duration(eta)}  throughput {throughput:7.1f} chars/s",
             f"current {current_batch_label}",
@@ -818,8 +973,12 @@ def create_continue_assets(
         str(runtime_options["inference_batch_size"]),
         "--max-inference-chars",
         str(runtime_options["max_inference_chars"]),
+        "--max-new-tokens",
+        str(runtime_options["max_new_tokens"]),
         "--language",
         str(runtime_options["language"]),
+        "--tts-backend",
+        str(runtime_options["tts_backend"]),
         "--model-id",
         str(runtime_options["model_id"]),
         "--device",
@@ -866,7 +1025,7 @@ def create_continue_assets(
         "continue_script_ps1": str(ps1_script_path),
     }
 
-def require_runtime_dependencies() -> tuple[Any, Any, Any, Any]:
+def require_runtime_dependencies(backend: str) -> tuple[Any, Any, Any, Any, Any, Any]:
     missing: list[str] = []
     try:
         import numpy as np  # type: ignore
@@ -883,11 +1042,20 @@ def require_runtime_dependencies() -> tuple[Any, Any, Any, Any]:
     except ImportError:
         torch = None
         missing.append("torch")
-    try:
-        from qwen_tts import Qwen3TTSModel  # type: ignore
-    except ImportError:
-        Qwen3TTSModel = None
-        missing.append("qwen-tts")
+
+    Qwen3TTSModel: Any = None
+    AutoModel: Any = None
+    AutoProcessor: Any = None
+    if backend == "qwen":
+        try:
+            from qwen_tts import Qwen3TTSModel  # type: ignore
+        except ImportError:
+            missing.append("qwen-tts")
+    elif is_moss_backend(backend):
+        try:
+            from transformers import AutoModel, AutoProcessor  # type: ignore
+        except ImportError:
+            missing.append("transformers")
 
     if missing:
         raise RuntimeError(
@@ -895,7 +1063,7 @@ def require_runtime_dependencies() -> tuple[Any, Any, Any, Any]:
             + ", ".join(missing)
             + ". Run scripts/install_linux_nvidia.sh or pip install -r requirements.txt."
         )
-    return np, sf, torch, Qwen3TTSModel
+    return np, sf, torch, Qwen3TTSModel, AutoModel, AutoProcessor
 
 
 def check_sox_installation() -> str | None:
@@ -1300,7 +1468,7 @@ def convert_wav_to_mp3(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create audiobooks from text using Qwen3-TTS voice cloning."
+        description="Create audiobooks from text using MOSS-TTS or Qwen3-TTS voice cloning."
     )
     parser.add_argument("--text-file", type=Path, help="Input text file.")
     parser.add_argument(
@@ -1374,10 +1542,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inference-batch-size",
         type=int,
-        default=1,
+        default=0,
         help=(
-            "Compatibility option. Batched inference is disabled for stability; "
-            "values greater than 1 are ignored."
+            "Number of text batches to synthesize per model.generate call. "
+            "Use 0 for auto-tuned size (default). "
+            "Qwen backend always uses 1."
         ),
     )
     parser.add_argument(
@@ -1398,13 +1567,34 @@ def parse_args() -> argparse.Namespace:
         "--model-id",
         type=str,
         default=DEFAULT_MODEL_ID,
-        help=f"Qwen model id/path (default: {DEFAULT_MODEL_ID}).",
+        help=(
+            "Model id/path. "
+            f"Default ({DEFAULT_TTS_BACKEND}): {DEFAULT_MODEL_ID}."
+        ),
+    )
+    parser.add_argument(
+        "--tts-backend",
+        type=str,
+        default=DEFAULT_TTS_BACKEND,
+        help=(
+            "Backend to use: moss-delay, moss-local, qwen, or auto "
+            f"(default: {DEFAULT_TTS_BACKEND})."
+        ),
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=DEFAULT_MAX_NEW_TOKENS,
+        help=(
+            "Maximum generated audio tokens per inference call for MOSS backends "
+            f"(default: {DEFAULT_MAX_NEW_TOKENS})."
+        ),
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cuda:0",
-        help='Device map for qwen-tts model loading (default: "cuda:0").',
+        help='Device target (default: "cuda:0").',
     )
     parser.add_argument(
         "--dtype",
@@ -1417,7 +1607,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_ATTN_IMPLEMENTATION,
         help=(
-            "Attention implementation for qwen-tts model loading "
+            "Attention implementation for model loading "
             f"(default: {DEFAULT_ATTN_IMPLEMENTATION})."
         ),
     )
@@ -1459,8 +1649,14 @@ def main() -> int:
     if args.mp3_quality < 0 or args.mp3_quality > 9:
         print("ERROR: --mp3-quality must be between 0 and 9.", file=sys.stderr)
         return 2
-    if args.inference_batch_size < 1:
-        print("ERROR: --inference-batch-size must be at least 1.", file=sys.stderr)
+    if args.inference_batch_size < 0:
+        print(
+            "ERROR: --inference-batch-size must be >= 0 (0 means auto).",
+            file=sys.stderr,
+        )
+        return 2
+    if args.max_new_tokens < 1:
+        print("ERROR: --max-new-tokens must be at least 1.", file=sys.stderr)
         return 2
 
     is_resume = args.resume_state is not None
@@ -1547,25 +1743,49 @@ def main() -> int:
     else:
         reference_text = ""
 
+    requested_backend = (
+        str(state.get("tts_backend"))
+        if is_resume
+        and args.tts_backend == DEFAULT_TTS_BACKEND
+        and state.get("tts_backend")
+        else args.tts_backend
+    )
+    if is_resume and args.tts_backend == DEFAULT_TTS_BACKEND and not state.get("tts_backend"):
+        # Backward compatibility with sessions created before backend tracking existed.
+        requested_backend = "auto"
+    model_id = (
+        str(state.get("model_id"))
+        if is_resume and args.model_id == DEFAULT_MODEL_ID and state.get("model_id")
+        else args.model_id
+    )
+    try:
+        tts_backend = resolve_tts_backend(requested_backend, model_id)
+    except ValueError as backend_exc:
+        print(f"ERROR: {backend_exc}", file=sys.stderr)
+        return 2
+
+    if (
+        args.model_id == DEFAULT_MODEL_ID
+        and not (is_resume and state.get("model_id"))
+        and normalize_tts_backend(args.tts_backend) in {"qwen", "moss-delay", "moss-local"}
+    ):
+        model_id = recommended_default_model_id(tts_backend)
+
     x_vector_only_mode = bool(args.x_vector_only_mode or state.get("x_vector_only_mode"))
-    if not x_vector_only_mode and not reference_text:
+    if tts_backend == "qwen" and not x_vector_only_mode and not reference_text:
         auto_hint = (
             f" (also looked for auto transcript: {auto_reference_text_path_hint})"
             if auto_reference_text_path_hint
             else ""
         )
         print(
-            "ERROR: reference transcript is required (or set --x-vector-only-mode)."
+            "ERROR: reference transcript is required for qwen backend "
+            "(or set --x-vector-only-mode)."
             + auto_hint,
             file=sys.stderr,
         )
         return 2
 
-    model_id = (
-        state.get("model_id")
-        if is_resume and args.model_id == DEFAULT_MODEL_ID and state.get("model_id")
-        else args.model_id
-    )
     max_chars = (
         int(state["max_chars_per_batch"])
         if is_resume
@@ -1594,9 +1814,16 @@ def main() -> int:
     inference_batch_size = (
         int(state["inference_batch_size"])
         if is_resume
-        and args.inference_batch_size == 1
-        and state.get("inference_batch_size")
+        and args.inference_batch_size == 0
+        and state.get("inference_batch_size") is not None
         else args.inference_batch_size
+    )
+    max_new_tokens = (
+        int(state["max_new_tokens"])
+        if is_resume
+        and args.max_new_tokens == DEFAULT_MAX_NEW_TOKENS
+        and state.get("max_new_tokens")
+        else args.max_new_tokens
     )
     max_inference_chars = (
         int(state["max_inference_chars"])
@@ -1605,13 +1832,6 @@ def main() -> int:
         and state.get("max_inference_chars")
         else args.max_inference_chars
     )
-    if inference_batch_size != 1:
-        warning = (
-            f"--inference-batch-size={inference_batch_size} requested, "
-            "but batched inference is disabled for stability; forcing to 1."
-        )
-        print(f"WARNING: {warning}")
-        inference_batch_size = 1
     language = (
         str(state["language"])
         if is_resume and args.language == "Auto" and state.get("language")
@@ -1798,16 +2018,19 @@ def main() -> int:
         print(line)
 
     try:
-        np, sf, torch, Qwen3TTSModel = require_runtime_dependencies()
+        np, sf, torch, Qwen3TTSModel, AutoModel, AutoProcessor = require_runtime_dependencies(
+            tts_backend
+        )
         completed_this_run = 0
         completed_chars_total = existing_chars
         if args.no_defrag_ui:
             print("status: Detailed text progress mode is active (--no-defrag-ui).")
             emit_progress("starting run")
 
-        sox_warning = check_sox_installation()
-        if sox_warning:
-            emit_status(sox_warning, warning=True)
+        if tts_backend == "qwen":
+            sox_warning = check_sox_installation()
+            if sox_warning:
+                emit_status(sox_warning, warning=True)
 
         arch_fatal, arch_message = check_cuda_arch_compatibility(torch, device)
         if arch_message:
@@ -1822,39 +2045,122 @@ def main() -> int:
         attn, attn_warning = choose_attention_implementation(attn)
         if attn_warning:
             emit_status(attn_warning, warning=True)
+        if is_moss_backend(tts_backend) and device.lower().startswith("cpu") and attn == "sdpa":
+            attn = "eager"
+            emit_status(
+                "CPU mode with MOSS backend prefers eager attention; falling back to eager.",
+                warning=True,
+            )
+
+        inference_batch_size, batch_size_warning = choose_inference_batch_size(
+            requested=inference_batch_size,
+            backend=tts_backend,
+            torch=torch,
+            device=device,
+            max_chars_per_batch=max_chars,
+        )
+        if batch_size_warning:
+            emit_status(batch_size_warning, warning=True)
+
         dtype_map = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
             "float32": torch.float32,
         }
-        try:
-            model = Qwen3TTSModel.from_pretrained(
-                model_id,
-                device_map=device,
-                dtype=dtype_map[dtype_name],
-                attn_implementation=attn,
-            )
-        except Exception as model_exc:
-            if attn != "sdpa":
-                fallback_msg = (
-                    f"Model load failed with attn '{attn}', retrying with 'sdpa'. "
-                    f"Reason: {model_exc}"
+        model: Any
+        processor: Any | None = None
+        clone_prompt: Any | None = None
+        torch_device = torch.device("cpu")
+        sample_rate_hint: int | None = None
+        if is_moss_backend(tts_backend):
+            if device.lower().startswith("cuda") and torch.cuda.is_available():
+                torch_device = torch.device(device)
+            elif device.lower().startswith("cuda"):
+                emit_status(
+                    "CUDA device was requested but is unavailable; running MOSS on CPU.",
+                    warning=True,
                 )
-                emit_status(fallback_msg, warning=True)
-                attn = "sdpa"
+                torch_device = torch.device("cpu")
+            else:
+                torch_device = torch.device(device)
+
+            assert AutoModel is not None and AutoProcessor is not None
+            processor = AutoProcessor.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+            )
+            if hasattr(processor, "audio_tokenizer"):
+                try:
+                    processor.audio_tokenizer = processor.audio_tokenizer.to(torch_device)
+                except Exception as tok_exc:
+                    emit_status(
+                        f"Audio tokenizer device placement failed ({tok_exc}); continuing with default placement.",
+                        warning=True,
+                    )
+
+            model_kwargs: dict[str, Any] = {
+                "trust_remote_code": True,
+                "torch_dtype": dtype_map[dtype_name],
+            }
+            if attn:
+                model_kwargs["attn_implementation"] = attn
+            try:
+                model = AutoModel.from_pretrained(model_id, **model_kwargs).to(torch_device)
+            except Exception as model_exc:
+                if attn not in {"sdpa", "eager"}:
+                    fallback_attn = "sdpa" if torch_device.type == "cuda" else "eager"
+                    fallback_msg = (
+                        f"Model load failed with attn '{attn}', retrying with '{fallback_attn}'. "
+                        f"Reason: {model_exc}"
+                    )
+                    emit_status(fallback_msg, warning=True)
+                    attn = fallback_attn
+                    model_kwargs["attn_implementation"] = attn
+                    model = AutoModel.from_pretrained(model_id, **model_kwargs).to(torch_device)
+                else:
+                    raise
+            model.eval()
+            if x_vector_only_mode:
+                emit_status(
+                    "--x-vector-only-mode is qwen-only and has no effect for MOSS backends.",
+                    warning=True,
+                )
+            sample_rate_hint = int(
+                getattr(getattr(processor, "model_config", None), "sampling_rate", 24000)
+            )
+        else:
+            assert Qwen3TTSModel is not None
+            try:
                 model = Qwen3TTSModel.from_pretrained(
                     model_id,
                     device_map=device,
                     dtype=dtype_map[dtype_name],
                     attn_implementation=attn,
                 )
-            else:
-                raise
-        emit_status("Building clone prompt...")
-        clone_prompt = model.create_voice_clone_prompt(
-            ref_audio=reference_audio,
-            ref_text=reference_text if reference_text else None,
-            x_vector_only_mode=x_vector_only_mode,
+            except Exception as model_exc:
+                if attn != "sdpa":
+                    fallback_msg = (
+                        f"Model load failed with attn '{attn}', retrying with 'sdpa'. "
+                        f"Reason: {model_exc}"
+                    )
+                    emit_status(fallback_msg, warning=True)
+                    attn = "sdpa"
+                    model = Qwen3TTSModel.from_pretrained(
+                        model_id,
+                        device_map=device,
+                        dtype=dtype_map[dtype_name],
+                        attn_implementation=attn,
+                    )
+                else:
+                    raise
+            emit_status("Building clone prompt...")
+            clone_prompt = model.create_voice_clone_prompt(
+                ref_audio=reference_audio,
+                ref_text=reference_text if reference_text else None,
+                x_vector_only_mode=x_vector_only_mode,
+            )
+        emit_status(
+            f"Loaded backend={tts_backend}, model={model_id}, inference_batch_size={inference_batch_size}."
         )
 
         state.update(
@@ -1870,6 +2176,7 @@ def main() -> int:
                 if reference_text_file
                 else None,
                 "x_vector_only_mode": x_vector_only_mode,
+                "tts_backend": tts_backend,
                 "output_audio": str(output_target),
                 "output_wav": str(output_target),
                 "model_id": model_id,
@@ -1884,6 +2191,7 @@ def main() -> int:
                 "use_chapters": use_chapters,
                 "inference_batch_size": inference_batch_size,
                 "max_inference_chars": max_inference_chars,
+                "max_new_tokens": max_new_tokens,
                 "part_files": part_files,
                 "batch_char_counts": state_batch_chars,
                 "chapter_batch_numbers": state_chapter_batches,
@@ -1904,6 +2212,7 @@ def main() -> int:
         runtime_options = {
             "reference_audio": reference_audio,
             "reference_text_file": reference_text_file,
+            "tts_backend": tts_backend,
             "output_wav": output_target,
             "max_chars_per_batch": max_chars,
             "pause_ms": pause_ms,
@@ -1912,6 +2221,7 @@ def main() -> int:
             "use_chapters": use_chapters,
             "inference_batch_size": inference_batch_size,
             "max_inference_chars": max_inference_chars,
+            "max_new_tokens": max_new_tokens,
             "language": language,
             "model_id": model_id,
             "device": device,
@@ -1922,43 +2232,121 @@ def main() -> int:
         }
         script_path = Path(__file__).resolve()
 
-        for local_index, batch in enumerate(batches, start=1):
+        next_local_index = 0
+        active_inference_batch_size = max(1, inference_batch_size)
+        while next_local_index < len(batches):
             if stop_controller.force_stop:
                 break
 
-            global_batch = existing_batches + completed_this_run + 1
-            batch_label = f"batch {global_batch}/{total_batches} ({batch.char_count} chars)"
+            remaining_count = len(batches) - next_local_index
+            group_size = min(active_inference_batch_size, remaining_count)
+            active_batches = batches[next_local_index : next_local_index + group_size]
+
+            first_global_batch = existing_batches + completed_this_run + 1
+            last_global_batch = first_global_batch + len(active_batches) - 1
+            group_char_count = sum(batch.char_count for batch in active_batches)
+            if first_global_batch == last_global_batch:
+                batch_label = (
+                    f"batch {first_global_batch}/{total_batches} ({group_char_count} chars)"
+                )
+            else:
+                batch_label = (
+                    f"batches {first_global_batch}-{last_global_batch}/{total_batches} "
+                    f"({group_char_count} chars total)"
+                )
 
             progress.set_active_batch(
-                global_batch,
-                batch.char_count,
+                first_global_batch,
+                group_char_count,
                 f"Generating {batch_label}...",
                 batch_label=batch_label,
-                active_batch_count=1,
+                active_batch_count=len(active_batches),
             )
             if args.no_defrag_ui:
                 emit_status(f"Generating {batch_label}...")
                 emit_progress(f"started {batch_label}")
 
-            started = time.time()
-            kwargs: dict[str, Any] = {
-                "text": batch.text,
-                "voice_clone_prompt": clone_prompt,
-            }
-            if language.lower() != "auto":
-                kwargs["language"] = language
+            def run_generation_group() -> tuple[list[Any], int]:
+                if is_moss_backend(tts_backend):
+                    assert processor is not None
+                    conversations: list[list[Any]] = []
+                    for current_batch in active_batches:
+                        message_kwargs: dict[str, Any] = {
+                            "text": current_batch.text,
+                            "reference": [reference_audio],
+                        }
+                        if language.lower() != "auto":
+                            message_kwargs["language"] = language
+                        conversations.append([processor.build_user_message(**message_kwargs)])
 
-            wavs: Any
-            sample_rate: Any
+                    packed = processor(conversations, mode="generation")
+                    input_ids = packed["input_ids"].to(torch_device)
+                    attention_mask = packed["attention_mask"].to(torch_device)
+                    outputs = model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        audio_temperature=float(DEFAULT_MOSS_AUDIO_TEMPERATURE),
+                        audio_top_p=float(DEFAULT_MOSS_AUDIO_TOP_P),
+                        audio_top_k=int(DEFAULT_MOSS_AUDIO_TOP_K),
+                        audio_repetition_penalty=float(
+                            DEFAULT_MOSS_AUDIO_REPETITION_PENALTY
+                        ),
+                    )
+                    messages = processor.decode(outputs)
+                    if not messages or len(messages) != len(active_batches):
+                        raise RuntimeError(
+                            "MOSS decode output size mismatch with requested batch size."
+                        )
+
+                    generated_audio: list[Any] = []
+                    for message in messages:
+                        if message is None or not getattr(message, "audio_codes_list", None):
+                            raise RuntimeError("MOSS decode returned an empty audio result.")
+                        audio_obj = message.audio_codes_list[0]
+                        if hasattr(audio_obj, "detach"):
+                            audio_obj = audio_obj.detach().float().cpu().numpy()
+                        else:
+                            audio_obj = np.asarray(audio_obj, dtype=np.float32)
+                        if getattr(audio_obj, "ndim", 1) > 1:
+                            audio_obj = audio_obj.reshape(-1)
+                        generated_audio.append(audio_obj)
+
+                    output_sample_rate = int(
+                        sample_rate_hint
+                        if sample_rate_hint is not None
+                        else getattr(getattr(processor, "model_config", None), "sampling_rate", 24000)
+                    )
+                    return generated_audio, output_sample_rate
+
+                assert clone_prompt is not None
+                if len(active_batches) != 1:
+                    raise RuntimeError("qwen backend only supports one batch per inference call.")
+                kwargs: dict[str, Any] = {
+                    "text": active_batches[0].text,
+                    "voice_clone_prompt": clone_prompt,
+                }
+                if language.lower() != "auto":
+                    kwargs["language"] = language
+                wavs, sample_rate = model.generate_voice_clone(**kwargs)
+                if not wavs:
+                    raise RuntimeError("Qwen backend returned empty audio output.")
+                return [wavs[0]], int(sample_rate)
+
+            started = time.time()
+            group_wavs: list[Any] | None = None
+            sample_rate: int | None = None
             cancel_succeeded = False
-            discard_batch_after_completion = False
+            discard_group_after_completion = False
+            retry_group_with_smaller_batch = False
             stop_message_shown = False
             abort_message_shown = False
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(model.generate_voice_clone, **kwargs)
+                future = executor.submit(run_generation_group)
                 while True:
                     try:
-                        wavs, sample_rate = future.result(timeout=0.15)
+                        group_wavs, sample_rate = future.result(timeout=0.15)
                         break
                     except concurrent.futures.TimeoutError:
                         if stop_controller.stop_requested and not stop_message_shown:
@@ -1966,82 +2354,119 @@ def main() -> int:
                             progress.mark_stop_requested()
                             if args.no_defrag_ui:
                                 emit_status(
-                                    "Stop requested; finishing current batch (Ctrl+C again to try abort)."
+                                    "Stop requested; finishing current inference group (Ctrl+C again to try abort)."
                                 )
                         if stop_controller.abort_current_batch and not abort_message_shown:
                             abort_message_shown = True
                             progress.mark_abort_requested()
                             if args.no_defrag_ui:
                                 emit_status(
-                                    "Abort requested; attempting to cancel current batch..."
+                                    "Abort requested; attempting to cancel current inference group..."
                                 )
                             cancel_succeeded = future.cancel()
                             if cancel_succeeded:
                                 break
-                            discard_batch_after_completion = True
+                            discard_group_after_completion = True
                         continue
+                    except Exception as gen_exc:
+                        if (
+                            is_moss_backend(tts_backend)
+                            and len(active_batches) > 1
+                            and is_cuda_oom_error(gen_exc)
+                        ):
+                            reduced = max(1, len(active_batches) // 2)
+                            active_inference_batch_size = reduced
+                            retry_group_with_smaller_batch = True
+                            emit_status(
+                                "CUDA OOM on grouped MOSS inference; reducing inference "
+                                f"batch size to {reduced} and retrying.",
+                                warning=True,
+                            )
+                            if torch.cuda.is_available():
+                                try:
+                                    torch.cuda.empty_cache()
+                                except Exception:
+                                    pass
+                            break
+                        raise
+
+            if retry_group_with_smaller_batch:
+                continue
 
             if cancel_succeeded:
                 progress.mark_batch_aborted(canceled=True)
                 stop_controller.request_stop()
                 if args.no_defrag_ui:
                     emit_status(
-                        f"Batch {global_batch}: canceled before execution; will remain in continue file."
+                        f"Batch group starting at {first_global_batch}: canceled before execution; will remain in continue file."
                     )
-                    emit_progress(f"batch {global_batch} canceled")
+                    emit_progress(f"batch group {first_global_batch}-{last_global_batch} canceled")
                 break
 
-            if not wavs:
+            if group_wavs is None or sample_rate is None or len(group_wavs) == 0:
                 raise RuntimeError(f"Empty audio output for {batch_label}.")
 
-            if discard_batch_after_completion:
+            if discard_group_after_completion:
                 progress.mark_batch_aborted(canceled=False)
                 stop_controller.request_stop()
                 if args.no_defrag_ui:
                     emit_status(
-                        f"Batch {global_batch}: could not be interrupted; output discarded so it remains in continue file."
+                        "Current inference group could not be interrupted; output discarded so it remains in continue file."
                     )
-                    emit_progress(f"batch {global_batch} discarded for resume")
+                    emit_progress(
+                        f"batch group {first_global_batch}-{last_global_batch} discarded for resume"
+                    )
                 break
 
+            if len(group_wavs) != len(active_batches):
+                raise RuntimeError(
+                    "Generated audio count does not match planned batch count."
+                )
+
             duration = time.time() - started
-            part_path = parts_dir / f"batch_{global_batch:05d}.wav"
-            sf.write(str(part_path), wavs[0], sample_rate)
-            part_files.append(str(part_path.relative_to(run_dir).as_posix()))
+            per_batch_duration = duration / float(max(1, len(active_batches)))
+            for batch_offset, batch in enumerate(active_batches):
+                global_batch = first_global_batch + batch_offset
+                audio_data = group_wavs[batch_offset]
+                part_path = parts_dir / f"batch_{global_batch:05d}.wav"
+                sf.write(str(part_path), audio_data, sample_rate)
+                part_files.append(str(part_path.relative_to(run_dir).as_posix()))
 
-            completed_this_run += 1
-            completed_chars_total += batch.char_count
-            state_batch_chars.append(batch.char_count)
-            if batch.starts_chapter:
-                state_chapter_batches.append(global_batch)
-                chapter_title = sanitize_chapter_title(batch.chapter_title)
-                if chapter_title:
-                    state_chapter_titles[global_batch] = chapter_title
-            plain_batch_durations.append(duration)
-            progress.mark_batch_complete(batch.char_count, duration)
-            if args.no_defrag_ui:
-                emit_status(f"Batch {global_batch}: complete in {duration:.1f}s")
-                emit_progress(f"completed batch {global_batch}")
+                completed_this_run += 1
+                completed_chars_total += batch.char_count
+                state_batch_chars.append(batch.char_count)
+                if batch.starts_chapter:
+                    state_chapter_batches.append(global_batch)
+                    chapter_title = sanitize_chapter_title(batch.chapter_title)
+                    if chapter_title:
+                        state_chapter_titles[global_batch] = chapter_title
+                plain_batch_durations.append(per_batch_duration)
+                progress.mark_batch_complete(batch.char_count, per_batch_duration)
+                if args.no_defrag_ui:
+                    emit_status(f"Batch {global_batch}: complete in {per_batch_duration:.1f}s")
+                    emit_progress(f"completed batch {global_batch}")
 
-            state["part_files"] = part_files
-            state["batch_char_counts"] = state_batch_chars
-            state["chapter_batch_numbers"] = state_chapter_batches
-            state["chapter_titles_by_batch"] = {
-                str(batch_number): title
-                for batch_number, title in sorted(state_chapter_titles.items())
-            }
-            state["completed_batches"] = len(part_files)
-            state["completed_characters"] = completed_chars_total
-            state["sample_rate"] = int(sample_rate)
-            state["updated_at"] = now_iso()
-            save_state(state_path, state)
+                state["part_files"] = part_files
+                state["batch_char_counts"] = state_batch_chars
+                state["chapter_batch_numbers"] = state_chapter_batches
+                state["chapter_titles_by_batch"] = {
+                    str(batch_number): title
+                    for batch_number, title in sorted(state_chapter_titles.items())
+                }
+                state["completed_batches"] = len(part_files)
+                state["completed_characters"] = completed_chars_total
+                state["sample_rate"] = int(sample_rate)
+                state["updated_at"] = now_iso()
+                save_state(state_path, state)
 
-            if args.stop_after_batch > 0 and local_index >= args.stop_after_batch:
-                stop_controller.request_stop()
+                if args.stop_after_batch > 0 and completed_this_run >= args.stop_after_batch:
+                    stop_controller.request_stop()
+
+            next_local_index += len(active_batches)
             if stop_controller.stop_requested:
                 progress.mark_stop_requested()
                 if args.no_defrag_ui:
-                    emit_status("Stop requested; exiting after current batch.")
+                    emit_status("Stop requested; exiting after current inference group.")
                 break
 
         combined_wav_path = (
@@ -2148,7 +2573,7 @@ def main() -> int:
         if "device-side assert triggered" in error_text.lower():
             error_text += (
                 " | CUDA context is now invalid for this process. Restart and retry with "
-                "single-batch generation (this app now forces one batch per inference call)."
+                "--inference-batch-size 1 and/or a smaller --max-chars-per-batch."
             )
         if "no kernel image is available for execution on the device" in error_text:
             error_text += (

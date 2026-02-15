@@ -1,63 +1,61 @@
-# Qwen3-TTS Audiobook Generator
+# MOSS/Qwen Audiobook Generator
 
-Simple CLI app that turns a `.txt` file into an audiobook with Qwen3-TTS voice cloning.
+CLI + Gradio app that turns a `.txt` file into an audiobook with voice cloning.
+
+Default backend is **MOSS-TTS Delay** (`OpenMOSS-Team/MOSS-TTS`) for long-form narration stability.  
+Qwen3-TTS is still supported as a fallback backend.
 
 ## Features
 
-- Uses Qwen3-TTS voice cloning (`create_voice_clone_prompt` + `generate_voice_clone`).
-- Splits text into paragraph-aware batches.
-- Combines short paragraphs until `--max-chars-per-batch` is reached.
-- Keeps paragraph boundaries by default, but splits oversized paragraphs at sentence endings.
-- Supports control tags in text:
-  - `[BREAK]`: force a batch boundary
-  - `[CHAPTER]`: force a batch boundary and mark a chapter start
-- Optional MP3 chapter embedding with `--use-chapters` (based on `[CHAPTER]` tags).
-- Supports extra silence before chapter starts via `--chapter-pause-ms`.
-- Combines all generated parts with pause spacing, then outputs high-quality MP3 by default.
-- Defrag-style live progress UI where each batch uses one block per 200 chars:
-  - red: pending
-  - blue: currently processing
-  - green: just completed
-  - white: completed
-  - gray marker: chapter break
-  - black marker: natural batch break
-- Includes a Gradio web UI (`gradio_app.py`) for interactive runs.
-- Graceful stop controls:
-  - `Ctrl+C` once: stop after current batch
-  - `Ctrl+C` twice: attempt to cancel current batch; if not interruptible, output is discarded and batch is kept for resume
-- Auto-generated resume assets on early stop:
-  - new `.txt` with remaining text
-  - `continue_*.sh`
-  - `continue_*.ps1`
-  - `session_state.json`
-- Linux NVIDIA auto-installer script.
+- Voice cloning with either:
+  - `moss-delay` (default, production/long-form focused)
+  - `moss-local` (smaller model)
+  - `qwen` (legacy compatibility)
+- Paragraph-aware batching with `[BREAK]` and `[CHAPTER]` control tags.
+- Auto-tuned inference grouping for MOSS (`--inference-batch-size 0`).
+- OOM-aware MOSS retry: automatically halves inference group size on CUDA OOM.
+- Pause controls (`--pause-ms`, `--chapter-pause-ms`).
+- Optional MP3 chapter metadata (`--use-chapters`).
+- Resume/continue assets on early stop.
+- Defrag-style progress UI in terminal and a Gradio UI (`gradio_app.py`).
 
-## Linux NVIDIA Auto-Install
+## Install
 
 ```bash
-cd qwen3-tts-auto
+pip install -r requirements.txt
+```
+
+For Linux NVIDIA setup:
+
+```bash
 chmod +x scripts/install_linux_nvidia.sh
 ./scripts/install_linux_nvidia.sh
 ```
 
-This installer:
-- checks for `nvidia-smi`
-- creates `.venv`
-- installs CUDA PyTorch wheels
-- installs system audio tools (`ffmpeg`, `sox`)
-- installs Python dependencies
-- attempts optional `flash-attn`
-
-## Basic Usage
+## Quick Start (Recommended: MOSS Delay)
 
 ```bash
 python audiobook_qwen3.py \
   --text-file /path/book.txt \
   --reference-audio /path/voice_ref.wav \
-  --output /path/book_audiobook.mp3 \
+  --tts-backend moss-delay \
+  --model-id OpenMOSS-Team/MOSS-TTS \
+  --inference-batch-size 0 \
   --max-chars-per-batch 1800 \
-  --pause-ms 300 \
-  --language Auto
+  --output /path/book_audiobook.mp3
+```
+
+## Qwen Fallback Example
+
+```bash
+python audiobook_qwen3.py \
+  --text-file /path/book.txt \
+  --reference-audio /path/voice_ref.wav \
+  --reference-text-file /path/voice_ref.txt \
+  --tts-backend qwen \
+  --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --x-vector-only-mode \
+  --output /path/book_audiobook.mp3
 ```
 
 ## Gradio UI
@@ -66,136 +64,50 @@ python audiobook_qwen3.py \
 python gradio_app.py
 ```
 
-Then open:
+Then open `http://127.0.0.1:7860`.
 
-- `http://127.0.0.1:7860`
+## Key Arguments
 
-Optional environment variables:
+- `--tts-backend`: `moss-delay`, `moss-local`, `qwen`, or `auto`.
+- `--model-id`: model id/path for selected backend.
+- `--reference-audio`: reference speech file/URL/path.
+- `--reference-text` / `--reference-text-file`:
+  - Required for `qwen` unless `--x-vector-only-mode` is set.
+  - Optional for MOSS backends.
+- `--max-chars-per-batch`: text chunk size.
+- `--inference-batch-size`:
+  - `0` = auto (recommended for MOSS).
+  - `>=1` fixed group size.
+  - Qwen backend is always forced to `1`.
+- `--max-new-tokens`: max generated tokens per MOSS inference call.
+- `--pause-ms`: silence between generated chunks.
+- `--chapter-pause-ms`: extra silence before chapter-start chunks.
+- `--use-chapters`: embed MP3 chapter metadata from `[CHAPTER]`.
+- `--no-defrag-ui`: verbose text progress mode.
 
-- `GRADIO_SERVER_NAME` (default: `127.0.0.1`)
-- `GRADIO_SERVER_PORT` (default: `7860`)
-- `GRADIO_SHARE` (`1/true` to enable public share links)
+## Control Tags
 
-## Important Arguments
+- `[BREAK]`: force a hard batch split.
+- `[CHAPTER]`: force split and mark next spoken batch as chapter start.
 
-- `--text-file`: input text file.
-- `--reference-audio`: reference audio for cloning.
-- If `--reference-audio` is omitted in interactive mode, the app scans the text file's folder for audio files that have matching `.txt` transcripts and prompts you to pick one.
-- `--reference-text` or `--reference-text-file`: transcript for reference audio.
-- If transcript args are omitted, the app auto-looks for `/path/to/<reference-audio-basename>.txt`.
-- `--x-vector-only-mode`: allow cloning without transcript.
-- `--max-chars-per-batch`: batch size control in characters.
-- `--pause-ms`: silence inserted between batch outputs.
-- `--chapter-pause-ms`: additional silence inserted before chapter-start batches.
-- `--mp3-quality`: MP3 VBR quality for final encode (`0` best, `9` smallest).
-- `--use-chapters`: embed MP3 chapter metadata from `[CHAPTER]` markers.
-- `--inference-batch-size`: compatibility option; batched mode is disabled and forced to `1`.
-- `--max-inference-chars`: compatibility option retained for old scripts; ignored.
-- `--output`: final path (`.mp3` recommended, `.wav` supported).
-- `--resume-state`: continue from an existing `session_state.json`.
-- `--attn-implementation`: attention backend (`sdpa` default, `flash_attention_2` optional).
-- `--dtype`: model precision (`bfloat16` default, auto-fallback to `float16` if unsupported).
-- `--no-defrag-ui`: disable defrag UI and print detailed text status/progress logs.
-
-## Text Control Tags
-
-You can place these tags anywhere in your input `.txt`:
-
-- `[BREAK]`: forces a hard batch split at that point.
-- `[CHAPTER]`: forces a hard batch split and marks the next spoken batch as a chapter start.
-  - When `--use-chapters` is enabled, the metadata chapter title is taken from text on the same line immediately after the tag (if any).
-
-Use `--use-chapters` to write those chapter starts into final MP3 chapter metadata.
-Chapter times are computed from actual combined audio, including configured `--pause-ms` and `--chapter-pause-ms`, so they align with playback.
+If `--use-chapters` is enabled, chapter times are embedded in final MP3 metadata.
 
 ## Early Stop + Continue
 
-Press `Ctrl+C` once while running.
+Press `Ctrl+C` once to stop after the current running inference group.
+Press `Ctrl+C` again to request abort of the current group.
 
-Behavior:
-1. Current batch is completed, or cancel is attempted for current batch on second `Ctrl+C`.
-2. Existing completed parts are combined into current output audio.
-3. The app writes:
-   - `continue_from_batch_XXXXX.txt`
-   - `continue_from_batch_XXXXX.sh`
-   - `continue_from_batch_XXXXX.ps1`
-   - updated `session_state.json`
+On stop, app writes:
 
-Run the generated continue script to finish remaining text.
+- `continue_from_batch_XXXXX.txt`
+- `continue_from_batch_XXXXX.sh`
+- `continue_from_batch_XXXXX.ps1`
+- updated `session_state.json`
 
 ## Notes
 
-- Default model is `Qwen/Qwen3-TTS-12Hz-1.7B-Base`.
-- Default attention is `sdpa` for reliability. If `flash-attn` is installed, you can use `--attn-implementation flash_attention_2`.
-- This project follows Qwen3-TTS API patterns from the official repository:
-  - https://github.com/QwenLM/Qwen3-TTS
-
-## Troubleshooting (RunPod)
-
-If you see:
-- `CUDA error: no kernel image is available for execution on the device`
-- `CUDA error: device-side assert triggered`
-
-Then your GPU architecture is likely not supported by the currently installed PyTorch CUDA wheel.
-
-Try:
-
-```bash
-python - <<'PY'
-import torch
-print("torch:", torch.__version__, "cuda:", torch.version.cuda)
-print("gpu:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
-print("capability:", torch.cuda.get_device_capability(0) if torch.cuda.is_available() else "n/a")
-print("arches:", torch.cuda.get_arch_list() if torch.cuda.is_available() else "n/a")
-PY
-```
-
-If your GPU capability is missing from `arches`, reinstall torch with a newer index URL:
-
-```bash
-python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-```
-
-Note: on some GPUs (for example RTX 4090 `sm_89`), torch may list `sm_86` without `sm_89`.  
-That can still work through same-major forward compatibility.
-
-And run with safe settings:
-
-```bash
-python audiobook_qwen3.py ... --dtype bfloat16 --attn-implementation sdpa
-```
-
-Batched inference was removed for stability after repeated CUDA assert failures on some GPU setups.
-
-If CUDA asserts still happen:
-
-```bash
-python audiobook_qwen3.py ... --device cpu --dtype float32 --attn-implementation sdpa
-```
-
-If CPU works but CUDA fails, the issue is in the CUDA stack (torch/cuda/driver image), not your text batching.
-
-If CPU works and CUDA still asserts, try this explicit GPU-safe combo first:
-
-```bash
-python audiobook_qwen3.py ... --dtype bfloat16 --attn-implementation sdpa --language Auto
-```
-
-If you see:
-- `/bin/sh: 1: sox: not found`
-
-Install SoX on the pod:
-
-```bash
-apt-get update && apt-get install -y sox
-```
-
-If you see:
-- `flash_attn_2_cuda ... undefined symbol ...`
-
-Then installed `flash-attn` is ABI-mismatched with your torch build. Use SDPA or reinstall:
-
-```bash
-python -m pip uninstall -y flash-attn flash_attn
-python audiobook_qwen3.py ... --attn-implementation sdpa
-```
+- Default model/backend:
+  - backend: `moss-delay`
+  - model: `OpenMOSS-Team/MOSS-TTS`
+- MOSS backends support real grouped inference in this app.
+- Qwen backend remains single-item generation for stability.

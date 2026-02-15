@@ -1,4 +1,9 @@
 qwen-tts>=0.0.6
+transformers>=5.0.0
+torchaudio>=2.5
+safetensors>=0.4
+tiktoken>=0.7
+einops>=0.8
 numpy>=1.26
 soundfile>=0.12.1
 hf_transfer
