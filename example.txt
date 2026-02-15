@@ -12,3 +12,11 @@ python audiobook_qwen3.py \
   --attn-implementation flash_attention_2 \
   --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --no-defrag-ui
+
+  python audiobook_qwen3.py \
+  --text-file Test.txt \
+  --reference-audio FrankieTreadaway.mp3 \
+  --tts-backend moss-delay \
+  --model-id OpenMOSS-Team/MOSS-TTS \
+  --inference-batch-size 0 \
+  --max-chars-per-batch 1800

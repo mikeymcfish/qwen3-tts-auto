@@ -45,6 +45,10 @@ chmod +x scripts/install_linux_nvidia.sh
 ./scripts/install_linux_nvidia.sh
 ```
 
+Installer behavior:
+- It now skips PyTorch reinstall if a CUDA-enabled `torch` is already working in the target `.venv`.
+- Set `FORCE_TORCH_INSTALL=1` to force reinstall from the selected CUDA wheel index.
+
 ## Quick Start (Recommended: MOSS Delay)
 
 ```bash
@@ -102,6 +106,7 @@ Then open `http://127.0.0.1:7860`.
 - `--tts-backend`: `moss-delay`, `moss-local`, `qwen`, or `auto`.
 - `--model-id`: model id/path for selected backend.
 - `--reference-audio`: reference speech file/URL/path.
+  - For MOSS backends, local compressed files (e.g. `.mp3`, `.m4a`) are auto-converted to WAV via `ffmpeg`.
 - `--reference-text` / `--reference-text-file`:
   - Required for `qwen` unless `--x-vector-only-mode` is set.
   - Optional for MOSS backends.

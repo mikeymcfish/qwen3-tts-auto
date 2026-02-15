@@ -74,8 +74,39 @@ if [[ "${GPU_CC_MAJOR}" -ge 12 ]]; then
 fi
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-${TORCH_INDEX_URL_DEFAULT}}"
 
-echo "[4/6] Installing PyTorch CUDA wheels from ${TORCH_INDEX_URL}..."
-python -m pip install --upgrade torch torchvision torchaudio --index-url "${TORCH_INDEX_URL}"
+echo "[4/6] Checking PyTorch CUDA wheels in the active venv..."
+FORCE_TORCH_INSTALL="${FORCE_TORCH_INSTALL:-0}"
+HAS_WORKING_TORCH_CUDA="0"
+if python - <<'PY'
+import importlib.util
+import sys
+
+if importlib.util.find_spec("torch") is None:
+    sys.exit(1)
+
+import torch
+
+has_cuda_runtime = bool(getattr(torch.version, "cuda", None))
+cuda_available = bool(torch.cuda.is_available())
+sys.exit(0 if (has_cuda_runtime and cuda_available) else 1)
+PY
+then
+  HAS_WORKING_TORCH_CUDA="1"
+fi
+
+if [[ "${FORCE_TORCH_INSTALL}" == "1" ]]; then
+  echo "FORCE_TORCH_INSTALL=1 set; reinstalling torch/torchvision/torchaudio."
+  python -m pip install --upgrade torch torchvision torchaudio --index-url "${TORCH_INDEX_URL}"
+elif [[ "${HAS_WORKING_TORCH_CUDA}" == "1" ]]; then
+  echo "Detected existing CUDA-enabled torch in this venv; skipping torch reinstall."
+  python - <<'PY'
+import torch
+print(f"torch={torch.__version__} cuda_runtime={torch.version.cuda} cuda_available={torch.cuda.is_available()}")
+PY
+else
+  echo "No working CUDA-enabled torch detected; installing PyTorch CUDA wheels from ${TORCH_INDEX_URL}..."
+  python -m pip install --upgrade torch torchvision torchaudio --index-url "${TORCH_INDEX_URL}"
+fi
 
 echo "[5/6] Installing project Python dependencies..."
 python -m pip install --upgrade -r requirements.txt
