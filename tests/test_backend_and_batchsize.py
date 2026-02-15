@@ -1,6 +1,7 @@
 import unittest
 
 from audiobook_qwen3 import (
+    apply_continuation_chain_constraints,
     choose_inference_batch_size,
     is_cuda_oom_error,
     resolve_tts_backend,
@@ -82,6 +83,23 @@ class BackendAndBatchSizeTests(unittest.TestCase):
         self.assertTrue(is_cuda_oom_error(RuntimeError("CUDA out of memory.")))
         self.assertTrue(is_cuda_oom_error(RuntimeError("CUBLAS_STATUS_ALLOC_FAILED")))
         self.assertFalse(is_cuda_oom_error(RuntimeError("network timeout")))
+
+    def test_continuation_chain_forces_single_batch(self) -> None:
+        size, warning = apply_continuation_chain_constraints(
+            backend="moss-delay",
+            continuation_chain=True,
+            inference_batch_size=4,
+        )
+        self.assertEqual(size, 1)
+        self.assertIsNotNone(warning)
+
+    def test_continuation_chain_rejects_qwen_backend(self) -> None:
+        with self.assertRaises(ValueError):
+            apply_continuation_chain_constraints(
+                backend="qwen",
+                continuation_chain=True,
+                inference_batch_size=1,
+            )
 
 
 if __name__ == "__main__":
