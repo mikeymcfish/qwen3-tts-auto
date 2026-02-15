@@ -1497,6 +1497,73 @@ def convert_wav_to_mp3(
         )
 
 
+def convert_audio_to_wav(
+    input_audio: Path,
+    output_wav: Path,
+) -> None:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise RuntimeError(
+            "ffmpeg is required to convert compressed reference audio to WAV for MOSS backend. "
+            "Install ffmpeg or provide a WAV reference audio file."
+        )
+    output_wav.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_audio),
+        "-map",
+        "0:a",
+        "-vn",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        str(output_wav),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(
+            "Reference audio conversion to WAV failed via ffmpeg."
+            + (f" Detail: {detail}" if detail else "")
+        )
+
+
+def prepare_reference_audio_for_moss(
+    reference_audio: str,
+    run_dir: Path,
+) -> tuple[str, str | None]:
+    try:
+        source = Path(reference_audio).expanduser()
+    except Exception:
+        return reference_audio, None
+
+    if not source.exists() or not source.is_file():
+        return reference_audio, None
+
+    source_resolved = source.resolve()
+    if source_resolved.suffix.lower() == ".wav":
+        return str(source_resolved), None
+
+    prepared_dir = run_dir / "prepared_audio"
+    target_wav = prepared_dir / f"{source_resolved.stem}_moss_ref.wav"
+    if not target_wav.exists() or target_wav.stat().st_mtime < source_resolved.stat().st_mtime:
+        convert_audio_to_wav(source_resolved, target_wav)
+
+    return (
+        str(target_wav.resolve()),
+        (
+            f"Converted reference audio to WAV for MOSS compatibility: "
+            f"{source_resolved.name} -> {target_wav.name}"
+        ),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create audiobooks from text using MOSS-TTS or Qwen3-TTS voice cloning."
@@ -1859,6 +1926,18 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if is_moss_backend(tts_backend):
+        try:
+            prepared_reference_audio, conversion_note = prepare_reference_audio_for_moss(
+                reference_audio=reference_audio,
+                run_dir=run_dir,
+            )
+        except RuntimeError as prep_exc:
+            print(f"ERROR: {prep_exc}", file=sys.stderr)
+            return 2
+        if conversion_note:
+            print(f"WARNING: {conversion_note}", file=sys.stderr)
+        reference_audio = prepared_reference_audio
     inference_batch_size = (
         int(state["inference_batch_size"])
         if is_resume
