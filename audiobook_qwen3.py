@@ -1058,10 +1058,20 @@ def require_runtime_dependencies(backend: str) -> tuple[Any, Any, Any, Any, Any,
             missing.append("transformers")
 
     if missing:
+        install_hint = (
+            "Run scripts/install_linux_nvidia.sh or pip install -r requirements.txt."
+        )
+        if backend == "qwen":
+            install_hint += (
+                " For qwen backend, also install qwen dependencies with "
+                "`pip install -r requirements-qwen.txt` "
+                "(prefer a separate virtual environment from MOSS)."
+            )
         raise RuntimeError(
             "Missing runtime dependencies: "
             + ", ".join(missing)
-            + ". Run scripts/install_linux_nvidia.sh or pip install -r requirements.txt."
+            + ". "
+            + install_hint
         )
     return np, sf, torch, Qwen3TTSModel, AutoModel, AutoProcessor
 

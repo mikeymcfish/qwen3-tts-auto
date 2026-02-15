@@ -25,6 +25,18 @@ Qwen3-TTS is still supported as a fallback backend.
 pip install -r requirements.txt
 ```
 
+This installs the **MOSS backend environment** (default).
+
+Qwen currently has a hard dependency conflict with MOSS:
+- `qwen-tts` pins `transformers==4.57.3`
+- MOSS uses `transformers>=5.0.0`
+
+Use a separate virtual environment for Qwen:
+
+```bash
+pip install -r requirements-qwen.txt
+```
+
 For Linux NVIDIA setup:
 
 ```bash
@@ -57,6 +69,8 @@ python audiobook_qwen3.py \
   --x-vector-only-mode \
   --output /path/book_audiobook.mp3
 ```
+
+Note: run this in your Qwen-specific environment if MOSS deps are also installed elsewhere.
 
 ## Gradio UI
 
