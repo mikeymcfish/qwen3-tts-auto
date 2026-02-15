@@ -19,8 +19,10 @@ from audiobook_qwen3 import (
     DEFAULT_CHAPTER_PAUSE_MS,
     DEFAULT_DTYPE,
     DEFAULT_MAX_CHARS,
+    DEFAULT_MAX_NEW_TOKENS,
     DEFAULT_MODEL_ID,
     DEFAULT_PAUSE_MS,
+    DEFAULT_TTS_BACKEND,
     REFERENCE_AUDIO_EXTENSIONS,
 )
 
@@ -121,10 +123,13 @@ def run_generation(
     mp3_quality: int,
     use_chapters: bool,
     language: str,
+    tts_backend: str,
     model_id: str,
     device: str,
     dtype: str,
     attn_implementation: str,
+    inference_batch_size: int,
+    max_new_tokens: int,
     stop_after_batch: int,
 ) -> Generator[tuple[str, str | None, str | None, str], None, None]:
     log_lines: list[str] = []
@@ -228,6 +233,8 @@ def run_generation(
                 str(int(mp3_quality)),
                 "--language",
                 language,
+                "--tts-backend",
+                tts_backend.strip() or DEFAULT_TTS_BACKEND,
                 "--model-id",
                 model_id.strip() or DEFAULT_MODEL_ID,
                 "--device",
@@ -236,6 +243,10 @@ def run_generation(
                 dtype,
                 "--attn-implementation",
                 attn_implementation,
+                "--inference-batch-size",
+                str(int(inference_batch_size)),
+                "--max-new-tokens",
+                str(int(max_new_tokens)),
                 "--no-defrag-ui",
             ]
         )
@@ -301,13 +312,13 @@ def build_demo() -> gr.Blocks:
     audio_types = sorted(REFERENCE_AUDIO_EXTENSIONS)
 
     with gr.Blocks(
-        title="Qwen3-TTS Audiobook Studio",
+        title="MOSS/Qwen Audiobook Studio",
         theme=gr.themes.Soft(primary_hue="sky", neutral_hue="slate"),
         css=css,
     ) as demo:
         gr.Markdown(
-            "## Qwen3-TTS Audiobook Studio\n"
-            "Generate audiobooks with chapter tags, pause controls, and MP3 chapter metadata."
+            "## MOSS/Qwen Audiobook Studio\n"
+            "Generate audiobooks with chapter tags, pause controls, adaptive inference batching, and MP3 chapter metadata."
         )
         with gr.Row(elem_classes=["app-shell"]):
             with gr.Column(scale=2):
@@ -393,6 +404,11 @@ def build_demo() -> gr.Blocks:
                 )
 
                 with gr.Accordion("Advanced", open=False):
+                    tts_backend = gr.Dropdown(
+                        label="TTS backend",
+                        choices=["moss-delay", "moss-local", "qwen", "auto"],
+                        value=DEFAULT_TTS_BACKEND,
+                    )
                     model_id = gr.Textbox(label="Model ID", value=DEFAULT_MODEL_ID)
                     device = gr.Textbox(label="Device", value="cuda:0")
                     dtype = gr.Dropdown(
@@ -404,6 +420,20 @@ def build_demo() -> gr.Blocks:
                         label="Attention implementation",
                         choices=["sdpa", "flash_attention_2"],
                         value=DEFAULT_ATTN_IMPLEMENTATION,
+                    )
+                    inference_batch_size = gr.Slider(
+                        label="Inference batch size (0 = auto)",
+                        minimum=0,
+                        maximum=16,
+                        step=1,
+                        value=0,
+                    )
+                    max_new_tokens = gr.Slider(
+                        label="Max new tokens (MOSS)",
+                        minimum=256,
+                        maximum=16384,
+                        step=128,
+                        value=DEFAULT_MAX_NEW_TOKENS,
                     )
                     stop_after_batch = gr.Number(
                         label="Stop after batch (testing)",
@@ -439,10 +469,13 @@ def build_demo() -> gr.Blocks:
                 mp3_quality,
                 use_chapters,
                 language,
+                tts_backend,
                 model_id,
                 device,
                 dtype,
                 attn_implementation,
+                inference_batch_size,
+                max_new_tokens,
                 stop_after_batch,
             ],
             outputs=[status, audio_output, file_output, logs],
