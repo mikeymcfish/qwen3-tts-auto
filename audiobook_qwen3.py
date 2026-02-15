@@ -203,6 +203,25 @@ def choose_inference_batch_size(
     )
 
 
+def apply_continuation_chain_constraints(
+    backend: str,
+    continuation_chain: bool,
+    inference_batch_size: int,
+) -> tuple[int, str | None]:
+    if not continuation_chain:
+        return inference_batch_size, None
+    if not is_moss_backend(backend):
+        raise ValueError(
+            "--continuation-chain is supported only for moss-delay or moss-local backends."
+        )
+    if inference_batch_size != 1:
+        return (
+            1,
+            "--continuation-chain requires sequential inference; forcing --inference-batch-size=1.",
+        )
+    return 1, None
+
+
 def is_cuda_oom_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     indicators = (
@@ -996,6 +1015,8 @@ def create_continue_assets(
         command_args.append("--x-vector-only-mode")
     if runtime_options.get("use_chapters"):
         command_args.append("--use-chapters")
+    if runtime_options.get("continuation_chain"):
+        command_args.append("--continuation-chain")
     if runtime_options.get("no_defrag_ui"):
         command_args.append("--no-defrag-ui")
 
@@ -1640,6 +1661,14 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Testing helper: stop after N batches in this invocation.",
     )
+    parser.add_argument(
+        "--continuation-chain",
+        action="store_true",
+        help=(
+            "MOSS-only high-continuity mode: generate batches sequentially via continuation "
+            "using previous generated audio+text as prefix context."
+        ),
+    )
     return parser.parse_args()
 
 def main() -> int:
@@ -1821,6 +1850,15 @@ def main() -> int:
         else args.mp3_quality
     )
     use_chapters = bool(args.use_chapters or state.get("use_chapters"))
+    continuation_chain = bool(
+        args.continuation_chain or state.get("continuation_chain")
+    )
+    if continuation_chain and not is_moss_backend(tts_backend):
+        print(
+            "ERROR: --continuation-chain is supported only with moss-delay or moss-local backends.",
+            file=sys.stderr,
+        )
+        return 2
     inference_batch_size = (
         int(state["inference_batch_size"])
         if is_resume
@@ -1984,6 +2022,36 @@ def main() -> int:
         chapter_batch_numbers=all_chapter_batches_for_view,
     )
 
+    continuation_audio_source = str(reference_audio)
+    continuation_prefix_text = reference_text.strip()
+    if continuation_chain:
+        if existing_batches > 0 and part_files:
+            last_generated_text = str(state.get("last_generated_batch_text") or "").strip()
+            last_part_path = resolve_paths(run_dir, [part_files[-1]])[0]
+            if last_part_path.exists() and last_generated_text:
+                continuation_audio_source = str(last_part_path)
+                continuation_prefix_text = last_generated_text
+            elif not continuation_prefix_text:
+                print(
+                    "ERROR: --continuation-chain resume requires either "
+                    "`last_generated_batch_text` in session state or a reference transcript.",
+                    file=sys.stderr,
+                )
+                return 2
+            else:
+                print(
+                    "WARNING: Could not recover last generated continuation anchor from state; "
+                    "falling back to original reference audio/text anchor.",
+                    file=sys.stderr,
+                )
+        elif not continuation_prefix_text:
+            print(
+                "ERROR: --continuation-chain requires a reference transcript "
+                "(`--reference-text` or `--reference-text-file`) for the initial anchor.",
+                file=sys.stderr,
+            )
+            return 2
+
     progress = DefragProgressView(
         total_batches=total_batches,
         total_chars=total_chars,
@@ -2071,6 +2139,19 @@ def main() -> int:
         )
         if batch_size_warning:
             emit_status(batch_size_warning, warning=True)
+        try:
+            (
+                inference_batch_size,
+                continuation_batch_warning,
+            ) = apply_continuation_chain_constraints(
+                backend=tts_backend,
+                continuation_chain=continuation_chain,
+                inference_batch_size=inference_batch_size,
+            )
+        except ValueError as continuation_exc:
+            raise RuntimeError(str(continuation_exc)) from continuation_exc
+        if continuation_batch_warning:
+            emit_status(continuation_batch_warning, warning=True)
 
         dtype_map = {
             "float16": torch.float16,
@@ -2199,6 +2280,7 @@ def main() -> int:
                 "chapter_pause_ms": chapter_pause_ms,
                 "mp3_quality": mp3_quality,
                 "use_chapters": use_chapters,
+                "continuation_chain": continuation_chain,
                 "inference_batch_size": inference_batch_size,
                 "max_inference_chars": max_inference_chars,
                 "max_new_tokens": max_new_tokens,
@@ -2215,6 +2297,8 @@ def main() -> int:
                 "remaining_text_file": None,
                 "continue_script_sh": None,
                 "continue_script_ps1": None,
+                "last_generated_batch_text": state.get("last_generated_batch_text"),
+                "last_generated_batch_file": state.get("last_generated_batch_file"),
             }
         )
         save_state(state_path, state)
@@ -2229,6 +2313,7 @@ def main() -> int:
             "chapter_pause_ms": chapter_pause_ms,
             "mp3_quality": mp3_quality,
             "use_chapters": use_chapters,
+            "continuation_chain": continuation_chain,
             "inference_batch_size": inference_batch_size,
             "max_inference_chars": max_inference_chars,
             "max_new_tokens": max_new_tokens,
@@ -2279,17 +2364,47 @@ def main() -> int:
             def run_generation_group() -> tuple[list[Any], int]:
                 if is_moss_backend(tts_backend):
                     assert processor is not None
-                    conversations: list[list[Any]] = []
-                    for current_batch in active_batches:
+                    if continuation_chain:
+                        if len(active_batches) != 1:
+                            raise RuntimeError(
+                                "--continuation-chain requires one batch per inference call."
+                            )
+                        current_batch = active_batches[0]
+                        continuation_text = (
+                            f"{continuation_prefix_text}\n{current_batch.text}".strip()
+                            if continuation_prefix_text
+                            else current_batch.text
+                        )
                         message_kwargs: dict[str, Any] = {
-                            "text": current_batch.text,
+                            "text": continuation_text,
                             "reference": [reference_audio],
                         }
                         if language.lower() != "auto":
                             message_kwargs["language"] = language
-                        conversations.append([processor.build_user_message(**message_kwargs)])
+                        conversations = [
+                            [
+                                processor.build_user_message(**message_kwargs),
+                                processor.build_assistant_message(
+                                    audio_codes_list=[continuation_audio_source]
+                                ),
+                            ]
+                        ]
+                        mode = "continuation"
+                    else:
+                        conversations = []
+                        for current_batch in active_batches:
+                            message_kwargs = {
+                                "text": current_batch.text,
+                                "reference": [reference_audio],
+                            }
+                            if language.lower() != "auto":
+                                message_kwargs["language"] = language
+                            conversations.append(
+                                [processor.build_user_message(**message_kwargs)]
+                            )
+                        mode = "generation"
 
-                    packed = processor(conversations, mode="generation")
+                    packed = processor(conversations, mode=mode)
                     input_ids = packed["input_ids"].to(torch_device)
                     attention_mask = packed["attention_mask"].to(torch_device)
                     outputs = model.generate(
@@ -2304,7 +2419,8 @@ def main() -> int:
                         ),
                     )
                     messages = processor.decode(outputs)
-                    if not messages or len(messages) != len(active_batches):
+                    expected_messages = 1 if continuation_chain else len(active_batches)
+                    if not messages or len(messages) != expected_messages:
                         raise RuntimeError(
                             "MOSS decode output size mismatch with requested batch size."
                         )
@@ -2441,6 +2557,9 @@ def main() -> int:
                 part_path = parts_dir / f"batch_{global_batch:05d}.wav"
                 sf.write(str(part_path), audio_data, sample_rate)
                 part_files.append(str(part_path.relative_to(run_dir).as_posix()))
+                if continuation_chain and is_moss_backend(tts_backend):
+                    continuation_audio_source = str(part_path.resolve())
+                    continuation_prefix_text = batch.text.strip()
 
                 completed_this_run += 1
                 completed_chars_total += batch.char_count
@@ -2466,6 +2585,10 @@ def main() -> int:
                 state["completed_batches"] = len(part_files)
                 state["completed_characters"] = completed_chars_total
                 state["sample_rate"] = int(sample_rate)
+                state["last_generated_batch_text"] = batch.text
+                state["last_generated_batch_file"] = str(
+                    part_path.relative_to(run_dir).as_posix()
+                )
                 state["updated_at"] = now_iso()
                 save_state(state_path, state)
 

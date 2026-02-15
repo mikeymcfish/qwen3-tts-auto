@@ -14,6 +14,7 @@ Qwen3-TTS is still supported as a fallback backend.
 - Paragraph-aware batching with `[BREAK]` and `[CHAPTER]` control tags.
 - Auto-tuned inference grouping for MOSS (`--inference-batch-size 0`).
 - OOM-aware MOSS retry: automatically halves inference group size on CUDA OOM.
+- Optional `--continuation-chain` mode for strongest cross-chunk continuity.
 - Pause controls (`--pause-ms`, `--chapter-pause-ms`).
 - Optional MP3 chapter metadata (`--use-chapters`).
 - Resume/continue assets on early stop.
@@ -72,6 +73,22 @@ python audiobook_qwen3.py \
 
 Note: run this in your Qwen-specific environment if MOSS deps are also installed elsewhere.
 
+## Best-Quality Long-Form Mode (MOSS)
+
+For maximum continuity (slower), enable continuation chaining:
+
+```bash
+python audiobook_qwen3.py \
+  --text-file /path/book.txt \
+  --reference-audio /path/voice_ref.wav \
+  --reference-text-file /path/voice_ref.txt \
+  --tts-backend moss-delay \
+  --continuation-chain \
+  --inference-batch-size 1 \
+  --max-chars-per-batch 1600 \
+  --output /path/book_audiobook.mp3
+```
+
 ## Gradio UI
 
 ```bash
@@ -94,6 +111,8 @@ Then open `http://127.0.0.1:7860`.
   - `>=1` fixed group size.
   - Qwen backend is always forced to `1`.
 - `--max-new-tokens`: max generated tokens per MOSS inference call.
+- `--continuation-chain`: MOSS-only sequential continuation mode.
+  Requires transcript anchor and forces sequential inference (`--inference-batch-size=1`).
 - `--pause-ms`: silence between generated chunks.
 - `--chapter-pause-ms`: extra silence before chapter-start chunks.
 - `--use-chapters`: embed MP3 chapter metadata from `[CHAPTER]`.

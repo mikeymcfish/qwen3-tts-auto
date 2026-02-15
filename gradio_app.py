@@ -130,6 +130,7 @@ def run_generation(
     attn_implementation: str,
     inference_batch_size: int,
     max_new_tokens: int,
+    continuation_chain: bool,
     stop_after_batch: int,
 ) -> Generator[tuple[str, str | None, str | None, str], None, None]:
     log_lines: list[str] = []
@@ -199,6 +200,18 @@ def run_generation(
             )
             yield _build_status_message("Missing reference transcript", message), None, None, message
             return
+        if (
+            continuation_chain
+            and not resume_state_path
+            and not reference_text.strip()
+            and not reference_text_file_path
+        ):
+            message = (
+                "Continuation chain mode requires a reference transcript for the initial anchor "
+                "(reference text or transcript file)."
+            )
+            yield _build_status_message("Missing continuation transcript", message), None, None, message
+            return
 
         if text_path:
             command.extend(["--text-file", str(text_path)])
@@ -252,6 +265,8 @@ def run_generation(
         )
         if use_chapters:
             command.append("--use-chapters")
+        if continuation_chain:
+            command.append("--continuation-chain")
         if stop_after_batch > 0:
             command.extend(["--stop-after-batch", str(int(stop_after_batch))])
     except Exception as exc:
@@ -435,6 +450,10 @@ def build_demo() -> gr.Blocks:
                         step=128,
                         value=DEFAULT_MAX_NEW_TOKENS,
                     )
+                    continuation_chain = gr.Checkbox(
+                        label="Continuation chain (best continuity, slower)",
+                        value=False,
+                    )
                     stop_after_batch = gr.Number(
                         label="Stop after batch (testing)",
                         value=0,
@@ -476,6 +495,7 @@ def build_demo() -> gr.Blocks:
                 attn_implementation,
                 inference_batch_size,
                 max_new_tokens,
+                continuation_chain,
                 stop_after_batch,
             ],
             outputs=[status, audio_output, file_output, logs],
