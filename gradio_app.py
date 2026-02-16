@@ -17,6 +17,7 @@ import gradio as gr
 from audiobook_qwen3 import (
     DEFAULT_ATTN_IMPLEMENTATION,
     DEFAULT_CHAPTER_PAUSE_MS,
+    DEFAULT_CONTINUATION_ANCHOR_SECONDS,
     DEFAULT_DTYPE,
     DEFAULT_MAX_CHARS,
     DEFAULT_MAX_NEW_TOKENS,
@@ -131,6 +132,7 @@ def run_generation(
     inference_batch_size: int,
     max_new_tokens: int,
     continuation_chain: bool,
+    continuation_anchor_seconds: float,
     stop_after_batch: int,
 ) -> Generator[tuple[str, str | None, str | None, str], None, None]:
     log_lines: list[str] = []
@@ -266,7 +268,13 @@ def run_generation(
         if use_chapters:
             command.append("--use-chapters")
         if continuation_chain:
-            command.append("--continuation-chain")
+            command.extend(
+                [
+                    "--continuation-chain",
+                    "--continuation-anchor-seconds",
+                    str(float(continuation_anchor_seconds)),
+                ]
+            )
         if stop_after_batch > 0:
             command.extend(["--stop-after-batch", str(int(stop_after_batch))])
     except Exception as exc:
@@ -454,6 +462,13 @@ def build_demo() -> gr.Blocks:
                         label="Continuation chain (best continuity, slower)",
                         value=False,
                     )
+                    continuation_anchor_seconds = gr.Slider(
+                        label="Continuation anchor seconds",
+                        minimum=2.0,
+                        maximum=30.0,
+                        step=0.5,
+                        value=DEFAULT_CONTINUATION_ANCHOR_SECONDS,
+                    )
                     stop_after_batch = gr.Number(
                         label="Stop after batch (testing)",
                         value=0,
@@ -496,6 +511,7 @@ def build_demo() -> gr.Blocks:
                 inference_batch_size,
                 max_new_tokens,
                 continuation_chain,
+                continuation_anchor_seconds,
                 stop_after_batch,
             ],
             outputs=[status, audio_output, file_output, logs],

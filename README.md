@@ -88,6 +88,7 @@ python audiobook_qwen3.py \
   --reference-text-file /path/voice_ref.txt \
   --tts-backend moss-delay \
   --continuation-chain \
+  --continuation-anchor-seconds 8 \
   --inference-batch-size 1 \
   --max-chars-per-batch 1600 \
   --output /path/book_audiobook.mp3
@@ -118,6 +119,9 @@ Then open `http://127.0.0.1:7860`.
 - `--max-new-tokens`: max generated tokens per MOSS inference call.
 - `--continuation-chain`: MOSS-only sequential continuation mode.
   Requires transcript anchor and forces sequential inference (`--inference-batch-size=1`).
+- `--continuation-anchor-seconds`: in continuation mode, cap previous-batch audio context
+  (and matching text suffix) to this duration. Lower values reduce VRAM use and can reduce
+  over-pausing inherited from long trailing silence.
 - `--pause-ms`: silence between generated chunks.
 - `--chapter-pause-ms`: extra silence before chapter-start chunks.
 - `--use-chapters`: embed MP3 chapter metadata from `[CHAPTER]`.

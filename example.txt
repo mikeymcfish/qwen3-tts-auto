@@ -13,10 +13,13 @@ python audiobook_qwen3.py \
   --model-id Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --no-defrag-ui
 
-  python audiobook_qwen3.py \
-  --text-file Test.txt \
-  --reference-audio FrankieTreadaway.mp3 \
+python audiobook_qwen3.py \
+  --text-file BuddhismandTheTwelve.txt \
+  --reference-audio GrahamVerchere.mp3 \
   --tts-backend moss-delay \
   --model-id OpenMOSS-Team/MOSS-TTS \
-  --inference-batch-size 0 \
-  --max-chars-per-batch 1800
+  --continuation-chain \
+  --inference-batch-size 1 \
+  --max-chars-per-batch 2200 \
+  --pause-ms 0 \
+  --no-defrag-ui

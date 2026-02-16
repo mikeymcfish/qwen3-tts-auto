@@ -38,6 +38,7 @@ DEFAULT_PAUSE_MS = 300
 DEFAULT_CHAPTER_PAUSE_MS = 0
 DEFAULT_MAX_INFERENCE_CHARS = 2600
 DEFAULT_MAX_NEW_TOKENS = 4096
+DEFAULT_CONTINUATION_ANCHOR_SECONDS = 10.0
 DEFAULT_MOSS_AUDIO_TEMPERATURE = 1.7
 DEFAULT_MOSS_AUDIO_TOP_P = 0.8
 DEFAULT_MOSS_AUDIO_TOP_K = 25
@@ -1017,6 +1018,12 @@ def create_continue_assets(
         command_args.append("--use-chapters")
     if runtime_options.get("continuation_chain"):
         command_args.append("--continuation-chain")
+        command_args.extend(
+            [
+                "--continuation-anchor-seconds",
+                str(runtime_options["continuation_anchor_seconds"]),
+            ]
+        )
     if runtime_options.get("no_defrag_ui"):
         command_args.append("--no-defrag-ui")
 
@@ -1564,6 +1571,82 @@ def prepare_reference_audio_for_moss(
     )
 
 
+def build_continuation_anchor(
+    sf: Any,
+    np: Any,
+    source_audio: str,
+    source_text: str,
+    anchor_dir: Path,
+    anchor_id: str,
+    max_seconds: float,
+) -> tuple[str, str, str | None]:
+    text = str(source_text or "").strip()
+    if max_seconds <= 0.0 or not text:
+        return source_audio, text, None
+
+    try:
+        source_path = Path(source_audio).expanduser()
+    except Exception:
+        return source_audio, text, None
+
+    if not source_path.exists() or not source_path.is_file():
+        return source_audio, text, None
+
+    try:
+        audio, sample_rate = sf.read(str(source_path), always_2d=True)
+    except Exception as exc:
+        return (
+            source_audio,
+            text,
+            f"Could not load continuation anchor audio ({source_path.name}): {exc}. Using full anchor.",
+        )
+
+    if audio.shape[0] <= 0:
+        return source_audio, text, None
+
+    energy = np.mean(np.abs(audio), axis=1)
+    non_silent = np.where(energy > 0.002)[0]
+    if non_silent.size > 0:
+        spoken_audio = audio[: int(non_silent[-1]) + 1]
+    else:
+        spoken_audio = audio
+
+    if spoken_audio.shape[0] <= 0:
+        return source_audio, text, None
+
+    max_samples = max(1, int(float(sample_rate) * float(max_seconds)))
+    if spoken_audio.shape[0] > max_samples:
+        kept_audio = spoken_audio[-max_samples:]
+    else:
+        kept_audio = spoken_audio
+
+    ratio = float(kept_audio.shape[0]) / float(max(1, spoken_audio.shape[0]))
+    keep_chars = min(len(text), max(80, int(len(text) * ratio)))
+    kept_text = text[-keep_chars:].strip() if keep_chars < len(text) else text
+    if not kept_text:
+        kept_text = text
+
+    anchor_dir.mkdir(parents=True, exist_ok=True)
+    anchor_path = anchor_dir / f"anchor_{anchor_id}.wav"
+    try:
+        sf.write(str(anchor_path), kept_audio.astype(np.float32), int(sample_rate))
+    except Exception as exc:
+        return (
+            source_audio,
+            kept_text,
+            f"Could not write continuation anchor audio ({anchor_path.name}): {exc}. Using full anchor.",
+        )
+
+    note = None
+    if kept_audio.shape[0] < audio.shape[0] or kept_text != text:
+        note = (
+            f"Prepared continuation anchor {anchor_path.name}: "
+            f"{source_path.name}, {kept_audio.shape[0] / float(sample_rate):.2f}s, "
+            f"{len(kept_text)} text chars."
+        )
+    return str(anchor_path.resolve()), kept_text, note
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create audiobooks from text using MOSS-TTS or Qwen3-TTS voice cloning."
@@ -1736,6 +1819,16 @@ def parse_args() -> argparse.Namespace:
             "using previous generated audio+text as prefix context."
         ),
     )
+    parser.add_argument(
+        "--continuation-anchor-seconds",
+        type=float,
+        default=DEFAULT_CONTINUATION_ANCHOR_SECONDS,
+        help=(
+            "When --continuation-chain is enabled, keep at most this many seconds "
+            "from the previous batch audio as continuation anchor "
+            f"(default: {DEFAULT_CONTINUATION_ANCHOR_SECONDS})."
+        ),
+    )
     return parser.parse_args()
 
 def main() -> int:
@@ -1763,6 +1856,12 @@ def main() -> int:
         return 2
     if args.max_new_tokens < 1:
         print("ERROR: --max-new-tokens must be at least 1.", file=sys.stderr)
+        return 2
+    if args.continuation_anchor_seconds <= 0:
+        print(
+            "ERROR: --continuation-anchor-seconds must be greater than 0.",
+            file=sys.stderr,
+        )
         return 2
 
     is_resume = args.resume_state is not None
@@ -1919,6 +2018,13 @@ def main() -> int:
     use_chapters = bool(args.use_chapters or state.get("use_chapters"))
     continuation_chain = bool(
         args.continuation_chain or state.get("continuation_chain")
+    )
+    continuation_anchor_seconds = (
+        float(state["continuation_anchor_seconds"])
+        if is_resume
+        and args.continuation_anchor_seconds == DEFAULT_CONTINUATION_ANCHOR_SECONDS
+        and state.get("continuation_anchor_seconds") is not None
+        else float(args.continuation_anchor_seconds)
     )
     if continuation_chain and not is_moss_backend(tts_backend):
         print(
@@ -2360,6 +2466,7 @@ def main() -> int:
                 "mp3_quality": mp3_quality,
                 "use_chapters": use_chapters,
                 "continuation_chain": continuation_chain,
+                "continuation_anchor_seconds": continuation_anchor_seconds,
                 "inference_batch_size": inference_batch_size,
                 "max_inference_chars": max_inference_chars,
                 "max_new_tokens": max_new_tokens,
@@ -2393,6 +2500,7 @@ def main() -> int:
             "mp3_quality": mp3_quality,
             "use_chapters": use_chapters,
             "continuation_chain": continuation_chain,
+            "continuation_anchor_seconds": continuation_anchor_seconds,
             "inference_batch_size": inference_batch_size,
             "max_inference_chars": max_inference_chars,
             "max_new_tokens": max_new_tokens,
@@ -2405,6 +2513,23 @@ def main() -> int:
             "no_defrag_ui": args.no_defrag_ui,
         }
         script_path = Path(__file__).resolve()
+        continuation_anchor_dir = run_dir / "continuation_anchors"
+        if continuation_chain and is_moss_backend(tts_backend):
+            (
+                continuation_audio_source,
+                continuation_prefix_text,
+                initial_anchor_note,
+            ) = build_continuation_anchor(
+                sf=sf,
+                np=np,
+                source_audio=continuation_audio_source,
+                source_text=continuation_prefix_text,
+                anchor_dir=continuation_anchor_dir,
+                anchor_id="initial",
+                max_seconds=continuation_anchor_seconds,
+            )
+            if initial_anchor_note:
+                emit_status(initial_anchor_note, warning=True)
 
         next_local_index = 0
         active_inference_batch_size = max(1, inference_batch_size)
@@ -2637,8 +2762,19 @@ def main() -> int:
                 sf.write(str(part_path), audio_data, sample_rate)
                 part_files.append(str(part_path.relative_to(run_dir).as_posix()))
                 if continuation_chain and is_moss_backend(tts_backend):
-                    continuation_audio_source = str(part_path.resolve())
-                    continuation_prefix_text = batch.text.strip()
+                    (
+                        continuation_audio_source,
+                        continuation_prefix_text,
+                        _anchor_note,
+                    ) = build_continuation_anchor(
+                        sf=sf,
+                        np=np,
+                        source_audio=str(part_path.resolve()),
+                        source_text=batch.text.strip(),
+                        anchor_dir=continuation_anchor_dir,
+                        anchor_id=f"{global_batch:05d}",
+                        max_seconds=continuation_anchor_seconds,
+                    )
 
                 completed_this_run += 1
                 completed_chars_total += batch.char_count
@@ -2670,6 +2806,11 @@ def main() -> int:
                 )
                 state["updated_at"] = now_iso()
                 save_state(state_path, state)
+                if continuation_chain and torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
 
                 if args.stop_after_batch > 0 and completed_this_run >= args.stop_after_batch:
                     stop_controller.request_stop()
