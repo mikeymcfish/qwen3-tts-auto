@@ -22,3 +22,11 @@ python audiobook_qwen3.py \
   --max-chars-per-batch 2200 \
   --pause-ms 50 \
   --output TheTroop.mp3 
+
+  python audiobook_qwen3.py \
+  --text-file test.txt \
+  --tts-backend moss-ttsd \
+  --model-id OpenMOSS-Team/MOSS-TTSD-v1.0 \
+  --reference-audio GrahamVerchere.mp3 \
+  --speaker2-reference-audio MaxJenkins.mp3 \
+  --output test.mp3

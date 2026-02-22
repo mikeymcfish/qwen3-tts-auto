@@ -2719,6 +2719,9 @@ def main() -> int:
         ttsd_prompt_audio_paths: list[str] | None = None
         ttsd_prompt_texts: list[str] | None = None
         ttsd_speaker_features: list[Any] | None = None
+        ttsd_reference_audio_codes: Any | None = None
+        ttsd_concat_prompt_audio_code: Any | None = None
+        ttsd_full_text_prefix: str = ""
         torch_device = torch.device("cpu")
         sample_rate_hint: int | None = None
         if is_moss_backend(tts_backend):
@@ -2778,10 +2781,6 @@ def main() -> int:
                 getattr(getattr(processor, "model_config", None), "sampling_rate", 24000)
             )
             if is_moss_ttsd_backend(tts_backend):
-                if not hasattr(processor, "extract_speaker"):
-                    raise RuntimeError(
-                        "moss-ttsd processor is missing extract_speaker(); use a supported MOSS-TTSD model/version."
-                    )
                 if not hasattr(processor, "build_user_message") or not hasattr(
                     processor, "build_assistant_message"
                 ):
@@ -2790,28 +2789,69 @@ def main() -> int:
                     )
                 ttsd_prompt_audio_paths = [str(reference_audio), str(speaker2_reference_audio)]
                 ttsd_prompt_texts = [reference_text.strip(), speaker2_reference_text.strip()]
-                ttsd_speaker_features = []
-                emit_status("Preparing native MOSS dialogue speaker features...")
-                for prompt_audio_path, prompt_text_value in zip(
-                    ttsd_prompt_audio_paths, ttsd_prompt_texts
-                ):
+                ttsd_full_text_prefix = " ".join(
+                    part.strip() for part in ttsd_prompt_texts if str(part).strip()
+                ).strip()
+                if hasattr(processor, "encode_audios_from_wav"):
                     try:
-                        speaker_audio, speaker_sr = sf.read(prompt_audio_path, always_2d=True)
-                    except Exception as exc:
+                        import torchaudio  # type: ignore
+                    except ImportError as exc:
                         raise RuntimeError(
-                            f"Could not load TTSD speaker reference audio '{prompt_audio_path}': {exc}"
+                            "moss-ttsd native dialogue mode requires torchaudio for prompt-audio encoding."
                         ) from exc
-                    if speaker_audio.shape[0] <= 0:
-                        raise RuntimeError(
-                            f"TTSD speaker reference audio is empty: {prompt_audio_path}"
-                        )
-                    speaker_audio_mono = speaker_audio.mean(axis=1).astype(np.float32, copy=False)
-                    speaker_features = processor.extract_speaker(
-                        speaker_audio_mono,
-                        prompt_text_value,
-                        sample_rate=int(speaker_sr),
+
+                    target_sr = int(
+                        getattr(getattr(processor, "audio_processor", None), "sampling_rate", 24000)
                     )
-                    ttsd_speaker_features.append(speaker_features)
+                    emit_status("Preparing native MOSS dialogue prompt audio codes...")
+
+                    def load_resampled_prompt_wav(path_str: str) -> Any:
+                        wav_tensor, wav_sr = torchaudio.load(path_str)
+                        if getattr(wav_tensor, "numel", lambda: 0)() == 0:
+                            raise RuntimeError(
+                                f"TTSD speaker reference audio is empty: {path_str}"
+                            )
+                        if int(wav_tensor.shape[0]) > 1:
+                            wav_tensor = wav_tensor.mean(dim=0, keepdim=True)
+                        if int(wav_sr) != target_sr:
+                            wav_tensor = torchaudio.functional.resample(
+                                wav_tensor, int(wav_sr), target_sr
+                            )
+                        return wav_tensor
+
+                    prompt_wavs = [load_resampled_prompt_wav(path) for path in ttsd_prompt_audio_paths]
+                    prompt_concat = torch.cat(prompt_wavs, dim=-1)
+                    ttsd_reference_audio_codes = processor.encode_audios_from_wav(prompt_wavs)
+                    ttsd_concat_prompt_audio_code = processor.encode_audios_from_wav([prompt_concat])[0]
+                elif hasattr(processor, "extract_speaker"):
+                    # Fallback for alternate/older TTSD-style processors.
+                    ttsd_speaker_features = []
+                    emit_status("Preparing native MOSS dialogue speaker features...")
+                    for prompt_audio_path, prompt_text_value in zip(
+                        ttsd_prompt_audio_paths, ttsd_prompt_texts
+                    ):
+                        try:
+                            speaker_audio, speaker_sr = sf.read(prompt_audio_path, always_2d=True)
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"Could not load TTSD speaker reference audio '{prompt_audio_path}': {exc}"
+                            ) from exc
+                        if speaker_audio.shape[0] <= 0:
+                            raise RuntimeError(
+                                f"TTSD speaker reference audio is empty: {prompt_audio_path}"
+                            )
+                        speaker_audio_mono = speaker_audio.mean(axis=1).astype(np.float32, copy=False)
+                        speaker_features = processor.extract_speaker(
+                            speaker_audio_mono,
+                            prompt_text_value,
+                            sample_rate=int(speaker_sr),
+                        )
+                        ttsd_speaker_features.append(speaker_features)
+                else:
+                    raise RuntimeError(
+                        "moss-ttsd processor is missing encode_audios_from_wav()/extract_speaker(); "
+                        "use a supported MOSS-TTSD model/version."
+                    )
         else:
             assert Qwen3TTSModel is not None
             try:
@@ -2995,18 +3035,37 @@ def main() -> int:
                     assert processor is not None
                     assert ttsd_prompt_audio_paths is not None
                     assert ttsd_prompt_texts is not None
-                    assert ttsd_speaker_features is not None
+                    use_ttsd_audio_code_prompts = (
+                        ttsd_reference_audio_codes is not None
+                        and ttsd_concat_prompt_audio_code is not None
+                    )
+                    if not use_ttsd_audio_code_prompts:
+                        assert ttsd_speaker_features is not None
 
                     conversations = []
                     for current_batch in active_batches:
-                        user_message = processor.build_user_message(
-                            text=current_batch.text,
-                            prompt_audio=ttsd_prompt_audio_paths,
-                            prompt_text=ttsd_prompt_texts,
-                        )
-                        assistant_message = processor.build_assistant_message(
-                            speaker_features=ttsd_speaker_features
-                        )
+                        if use_ttsd_audio_code_prompts:
+                            full_text = (
+                                f"{ttsd_full_text_prefix} {current_batch.text}".strip()
+                                if ttsd_full_text_prefix
+                                else current_batch.text
+                            )
+                            user_message = processor.build_user_message(
+                                text=full_text,
+                                reference=ttsd_reference_audio_codes,
+                            )
+                            assistant_message = processor.build_assistant_message(
+                                audio_codes_list=[ttsd_concat_prompt_audio_code]
+                            )
+                        else:
+                            user_message = processor.build_user_message(
+                                text=current_batch.text,
+                                prompt_audio=ttsd_prompt_audio_paths,
+                                prompt_text=ttsd_prompt_texts,
+                            )
+                            assistant_message = processor.build_assistant_message(
+                                speaker_features=ttsd_speaker_features
+                            )
                         conversations.append([user_message, assistant_message])
 
                     def decode_ttsd_audio_messages(decoded_items: Any) -> list[Any]:
@@ -3026,6 +3085,8 @@ def main() -> int:
                                             break
                             if audio_obj is None and hasattr(item, "audio_url"):
                                 audio_obj = getattr(item, "audio_url")
+                            if audio_obj is None and getattr(item, "audio_codes_list", None):
+                                audio_obj = item.audio_codes_list[0]
                             if audio_obj is None:
                                 raise RuntimeError(
                                     "MOSS-TTSD decode returned an item without audio content."
@@ -3043,7 +3104,10 @@ def main() -> int:
                         return audio_list
 
                     def generate_and_decode_ttsd_messages() -> list[Any]:
-                        packed = processor(conversations, mode="batch")
+                        packed = processor(
+                            conversations,
+                            mode="continuation" if use_ttsd_audio_code_prompts else "batch",
+                        )
                         model_inputs: dict[str, Any] = {}
                         for key, value in packed.items():
                             if hasattr(torch, "Tensor") and isinstance(value, torch.Tensor):
