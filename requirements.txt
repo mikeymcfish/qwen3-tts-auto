@@ -8,3 +8,4 @@ numpy>=1.26
 soundfile>=0.12.1
 hf_transfer
 gradio>=5.0.0
+torchcodec
