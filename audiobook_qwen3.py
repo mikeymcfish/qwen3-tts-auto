@@ -30,6 +30,7 @@ DEFAULT_TTS_BACKEND = "moss-delay"
 DEFAULT_MODEL_ID_BY_BACKEND = {
     "moss-delay": "OpenMOSS-Team/MOSS-TTS",
     "moss-local": "OpenMOSS-Team/MOSS-TTS-Local-Transformer",
+    "moss-ttsd": "OpenMOSS-Team/MOSS-TTSD-v1.0",
     "qwen": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
 }
 DEFAULT_MODEL_ID = DEFAULT_MODEL_ID_BY_BACKEND[DEFAULT_TTS_BACKEND]
@@ -58,6 +59,8 @@ REFERENCE_AUDIO_EXTENSIONS = {
 }
 BREAK_TAG = "[BREAK]"
 CHAPTER_TAG = "[CHAPTER]"
+SPEAKER1_TAG = "[S1]"
+SPEAKER2_TAG = "[S2]"
 
 
 @dataclass
@@ -70,6 +73,7 @@ class TextBatch:
     starts_chapter: bool = False
     forced_break_before: bool = False
     chapter_title: str | None = None
+    speaker_id: int | None = None
 
 
 class LineCaptureStream:
@@ -142,6 +146,9 @@ def normalize_tts_backend(value: str) -> str:
         "local": "moss-local",
         "moss-local": "moss-local",
         "moss-local-transformer": "moss-local",
+        "ttsd": "moss-ttsd",
+        "moss-ttsd": "moss-ttsd",
+        "moss-dialogue": "moss-ttsd",
         "qwen3": "qwen",
         "qwen": "qwen",
         "auto": "auto",
@@ -151,6 +158,8 @@ def normalize_tts_backend(value: str) -> str:
 
 def infer_backend_from_model_id(model_id: str) -> str:
     lowered = (model_id or "").strip().lower()
+    if "moss-ttsd" in lowered:
+        return "moss-ttsd"
     if "moss" in lowered:
         if "local" in lowered:
             return "moss-local"
@@ -162,16 +171,24 @@ def resolve_tts_backend(requested_backend: str, model_id: str) -> str:
     normalized = normalize_tts_backend(requested_backend)
     if normalized == "auto":
         return infer_backend_from_model_id(model_id)
-    if normalized not in {"qwen", "moss-delay", "moss-local"}:
+    if normalized not in {"qwen", "moss-delay", "moss-local", "moss-ttsd"}:
         raise ValueError(
             f"Unsupported --tts-backend '{requested_backend}'. "
-            "Use one of: qwen, moss-delay, moss-local, auto."
+            "Use one of: qwen, moss-delay, moss-local, moss-ttsd, auto."
         )
     return normalized
 
 
-def is_moss_backend(backend: str) -> bool:
+def is_moss_classic_backend(backend: str) -> bool:
     return backend in {"moss-delay", "moss-local"}
+
+
+def is_moss_ttsd_backend(backend: str) -> bool:
+    return backend == "moss-ttsd"
+
+
+def is_moss_backend(backend: str) -> bool:
+    return is_moss_classic_backend(backend) or is_moss_ttsd_backend(backend)
 
 
 def recommended_default_model_id(backend: str) -> str:
@@ -217,6 +234,15 @@ def choose_inference_batch_size(
                 f"--inference-batch-size={requested} requested, but qwen backend is single-item only; forcing to 1.",
             )
         return (1, None)
+    if is_moss_ttsd_backend(backend):
+        if requested > 1:
+            return (
+                1,
+                f"--inference-batch-size={requested} requested, but moss-ttsd native dialogue mode is currently single-item only; forcing to 1.",
+            )
+        if requested == 1:
+            return (1, None)
+        return (1, "Auto inference batch size selected 1 for moss-ttsd native dialogue mode.")
 
     if requested >= 1:
         return (requested, None)
@@ -272,7 +298,7 @@ def apply_continuation_chain_constraints(
 ) -> tuple[int, str | None]:
     if not continuation_chain:
         return inference_batch_size, None
-    if not is_moss_backend(backend):
+    if not is_moss_classic_backend(backend):
         raise ValueError(
             "--continuation-chain is supported only for moss-delay or moss-local backends."
         )
@@ -415,7 +441,7 @@ def prompt_for_reference_audio_selection(
         )
 
 
-def split_into_paragraphs(raw_text: str) -> list[str]:
+def split_into_paragraphs(raw_text: str, split_speaker_tags: bool = False) -> list[str]:
     normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
         return []
@@ -424,6 +450,12 @@ def split_into_paragraphs(raw_text: str) -> list[str]:
         lambda match: f"\n\n[{match.group(1).upper()}]\n\n",
         normalized,
     )
+    if split_speaker_tags:
+        normalized = re.sub(
+            r"(?i)\[(S1|S2)\]",
+            lambda match: f"\n\n[{match.group(1).upper()}]\n\n",
+            normalized,
+        )
     chunks = re.split(r"\n\s*\n+", normalized)
     paragraphs: list[str] = []
     for chunk in chunks:
@@ -525,6 +557,10 @@ def parse_control_tag(paragraph: str) -> str | None:
         return "break"
     if token == CHAPTER_TAG:
         return "chapter"
+    if token == SPEAKER1_TAG:
+        return "speaker1"
+    if token == SPEAKER2_TAG:
+        return "speaker2"
     return None
 
 
@@ -550,6 +586,7 @@ def build_batches(
     paragraphs: list[str],
     max_chars_per_batch: int,
     chapter_titles: list[str] | None = None,
+    enable_speaker_tags: bool = False,
 ) -> list[TextBatch]:
     if max_chars_per_batch < 100:
         raise ValueError("--max-chars-per-batch must be at least 100.")
@@ -561,13 +598,15 @@ def build_batches(
     current_starts_chapter = False
     current_forced_break_before = False
     current_chapter_title: str | None = None
+    current_speaker_id: int | None = 1 if enable_speaker_tags else None
     pending_chapter = False
     pending_forced_break = False
     pending_chapter_title: str | None = None
+    pending_speaker_id: int | None = 1 if enable_speaker_tags else None
     chapter_title_index = 0
 
     def flush() -> None:
-        nonlocal current_text, start_idx, end_idx, current_starts_chapter, current_forced_break_before, current_chapter_title
+        nonlocal current_text, start_idx, end_idx, current_starts_chapter, current_forced_break_before, current_chapter_title, current_speaker_id
         if not current_text:
             return
         batches.append(
@@ -580,6 +619,7 @@ def build_batches(
                 starts_chapter=current_starts_chapter,
                 forced_break_before=current_forced_break_before,
                 chapter_title=current_chapter_title,
+                speaker_id=current_speaker_id if enable_speaker_tags else None,
             )
         )
         current_text = ""
@@ -588,9 +628,15 @@ def build_batches(
         current_starts_chapter = False
         current_forced_break_before = False
         current_chapter_title = None
+        current_speaker_id = pending_speaker_id if enable_speaker_tags else None
 
     for idx, paragraph in enumerate(paragraphs):
         control = parse_control_tag(paragraph)
+        if enable_speaker_tags and control in {"speaker1", "speaker2"}:
+            flush()
+            pending_speaker_id = 1 if control == "speaker1" else 2
+            current_speaker_id = pending_speaker_id
+            continue
         if control == "break":
             flush()
             pending_forced_break = True
@@ -624,6 +670,7 @@ def build_batches(
                 current_starts_chapter = pending_chapter
                 current_forced_break_before = pending_forced_break
                 current_chapter_title = pending_chapter_title
+                current_speaker_id = pending_speaker_id if enable_speaker_tags else None
                 pending_chapter = False
                 pending_forced_break = False
                 pending_chapter_title = None
@@ -634,6 +681,28 @@ def build_batches(
 
     flush()
     return batches
+
+
+def speaker_tag_for_id(speaker_id: int | None) -> str | None:
+    if speaker_id == 1:
+        return SPEAKER1_TAG
+    if speaker_id == 2:
+        return SPEAKER2_TAG
+    return None
+
+
+def infer_speaker_id_from_dialogue_text(text: str) -> int | None:
+    if not text:
+        return None
+    matches = list(re.finditer(r"(?i)\[(S1|S2)\]", text))
+    if not matches:
+        return None
+    first = matches[0].group(1).upper()
+    if first == "S1":
+        return 1
+    if first == "S2":
+        return 2
+    return None
 
 
 class StopController:
@@ -699,6 +768,9 @@ class DefragProgressView:
     COLOR_DIM = "\x1b[90m"
     COLOR_LIGHT_GRAY = "\x1b[37m"
     COLOR_BLACK = "\x1b[30m"
+    COLOR_DEEP_BLUE = "\x1b[34m"
+    COLOR_RED_DIM = "\x1b[31m"
+    COLOR_DEEP_BLUE_BRIGHT = "\x1b[94m"
     GLYPH_PENDING = "\u25ae"
     GLYPH_WORKING_A = "\u25ae"
     GLYPH_WORKING_B = "\u25af"
@@ -717,6 +789,7 @@ class DefragProgressView:
         enabled: bool,
         batch_char_counts: list[int] | None = None,
         batch_boundary_types: list[str] | None = None,
+        batch_speaker_ids: list[int] | None = None,
     ) -> None:
         self.total_batches = max(1, total_batches)
         self.total_chars = max(1, total_chars)
@@ -761,6 +834,17 @@ class DefragProgressView:
             self._batch_boundary_types = normalized_boundary_types
         else:
             self._batch_boundary_types = build_batch_boundary_types(self.total_batches)
+        if batch_speaker_ids and len(batch_speaker_ids) == self.total_batches:
+            normalized_speakers = []
+            for value in batch_speaker_ids:
+                try:
+                    speaker_num = int(value)
+                except (TypeError, ValueError):
+                    speaker_num = 0
+                normalized_speakers.append(speaker_num if speaker_num in {1, 2} else 0)
+            self._batch_speaker_ids = normalized_speakers
+        else:
+            self._batch_speaker_ids = [0 for _ in range(self.total_batches)]
 
     def start(self) -> None:
         if not self.enabled:
@@ -922,6 +1006,7 @@ class DefragProgressView:
         completed_blocks = sum(self._batch_block_counts[:completed_batches])
         throughput = completed_chars / elapsed if elapsed > 0 else 0.0
         beat = self._tick % 4
+        has_speaker_colors = any(value in {1, 2} for value in self._batch_speaker_ids)
 
         lines: list[str] = []
         line_parts: list[str] = []
@@ -942,9 +1027,26 @@ class DefragProgressView:
                 remaining -= take
 
         for batch_number, block_count in enumerate(self._batch_block_counts, start=1):
+            speaker_id = self._batch_speaker_ids[batch_number - 1]
+            speaker_base_color: str | None = None
+            speaker_alt_color: str | None = None
+            speaker_pending_color: str | None = None
+            if speaker_id == 1:
+                speaker_base_color = self.COLOR_RED
+                speaker_alt_color = self.COLOR_RED_DIM
+                speaker_pending_color = self.COLOR_RED_DIM
+            elif speaker_id == 2:
+                speaker_base_color = self.COLOR_DEEP_BLUE
+                speaker_alt_color = self.COLOR_DEEP_BLUE_BRIGHT
+                speaker_pending_color = self.COLOR_DEEP_BLUE
             active_batch = active_start <= batch_number <= active_end
             if active_batch:
-                color = self.COLOR_BLUE if beat % 2 == 0 else self.COLOR_MAGENTA
+                if speaker_base_color:
+                    color = speaker_base_color if beat % 2 == 0 else (
+                        speaker_alt_color or speaker_base_color
+                    )
+                else:
+                    color = self.COLOR_BLUE if beat % 2 == 0 else self.COLOR_MAGENTA
                 glyph = (
                     self.GLYPH_WORKING_A if beat % 2 == 0 else self.GLYPH_WORKING_B
                 )
@@ -953,11 +1055,19 @@ class DefragProgressView:
                     color = self.COLOR_GREEN
                     glyph = self.GLYPH_DONE
                 else:
-                    color = self.COLOR_WHITE
-                    glyph = self.GLYPH_COMPLETE
+                    if speaker_base_color:
+                        color = speaker_base_color
+                        glyph = self.GLYPH_COMPLETE
+                    else:
+                        color = self.COLOR_WHITE
+                        glyph = self.GLYPH_COMPLETE
             else:
-                color = self.COLOR_RED
-                glyph = self.GLYPH_PENDING
+                if speaker_pending_color:
+                    color = speaker_pending_color
+                    glyph = self.GLYPH_EMPTY
+                else:
+                    color = self.COLOR_RED
+                    glyph = self.GLYPH_PENDING
 
             append_colored_cells(color, glyph, block_count)
 
@@ -986,6 +1096,12 @@ class DefragProgressView:
             f"blocks: {completed_blocks}/{total_blocks}  (1 block = {self.CHARS_PER_BLOCK} chars)  grid={blocks_per_row}/row",
             f"status: {self.COLOR_YELLOW}{status}{self.COLOR_RESET}",
             f"backend: {self.COLOR_DIM}{backend_status or '(quiet)'}{self.COLOR_RESET}",
+            (
+                f"speakers: {self.COLOR_RED}S1{self.COLOR_RESET} / "
+                f"{self.COLOR_DEEP_BLUE}S2{self.COLOR_RESET} (pending shown hollow)"
+                if has_speaker_colors
+                else "speakers: single-speaker mode"
+            ),
             f"legend: {self.COLOR_RED}{self.GLYPH_PENDING}{self.COLOR_RESET}=pending  "
             f"{self.COLOR_BLUE}{self.GLYPH_WORKING_A}{self.COLOR_RESET}=working  "
             f"{self.COLOR_GREEN}{self.GLYPH_DONE}{self.COLOR_RESET}=done-now  "
@@ -1045,6 +1161,9 @@ def create_continue_assets(
                 remaining_segments.append(CHAPTER_TAG)
         elif batch.forced_break_before:
             remaining_segments.append(BREAK_TAG)
+        speaker_tag = speaker_tag_for_id(batch.speaker_id)
+        if speaker_tag:
+            remaining_segments.append(speaker_tag)
         remaining_segments.append(batch.text)
     remaining_text = "\n\n".join(remaining_segments).strip() + "\n"
     write_text_file(remaining_text_path, remaining_text)
@@ -1089,6 +1208,19 @@ def create_continue_assets(
         command_args.extend(
             ["--reference-text-file", str(runtime_options["reference_text_file"])]
         )
+    if runtime_options.get("speaker2_reference_text_file"):
+        command_args.extend(
+            [
+                "--speaker2-reference-text-file",
+                str(runtime_options["speaker2_reference_text_file"]),
+            ]
+        )
+    if runtime_options.get("speaker2_reference_audio"):
+        command_args.extend(
+            ["--speaker2-reference-audio", str(runtime_options["speaker2_reference_audio"])]
+        )
+    if runtime_options.get("speaker_tags"):
+        command_args.append("--speaker-tags")
     if runtime_options.get("x_vector_only_mode"):
         command_args.append("--x-vector-only-mode")
     if runtime_options.get("use_chapters"):
@@ -1737,6 +1869,22 @@ def parse_args() -> argparse.Namespace:
             "If omitted in interactive mode, the app can prompt from files in the text-file folder."
         ),
     )
+    parser.add_argument(
+        "--speaker2-reference-audio",
+        type=str,
+        help=(
+            "Optional second reference audio for MOSS two-speaker mode. "
+            "Use [S1]/[S2] tags in the text file to switch speakers."
+        ),
+    )
+    parser.add_argument(
+        "--speaker-tags",
+        action="store_true",
+        help=(
+            "Enable [S1]/[S2] speaker tags in the input text (MOSS backends only). "
+            "If --speaker2-reference-audio is set, this is enabled automatically."
+        ),
+    )
     ref_group = parser.add_mutually_exclusive_group(required=False)
     ref_group.add_argument(
         "--reference-text", type=str, help="Transcript for the reference audio."
@@ -1747,6 +1895,20 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Path to transcript text file. If omitted, the app will try "
             "to use <reference-audio-basename>.txt from the same folder."
+        ),
+    )
+    speaker2_ref_group = parser.add_mutually_exclusive_group(required=False)
+    speaker2_ref_group.add_argument(
+        "--speaker2-reference-text",
+        type=str,
+        help="Transcript for --speaker2-reference-audio (used by moss-ttsd native dialogue mode).",
+    )
+    speaker2_ref_group.add_argument(
+        "--speaker2-reference-text-file",
+        type=Path,
+        help=(
+            "Path to transcript text file for --speaker2-reference-audio. "
+            "If omitted, the app will try <speaker2-reference-audio-basename>.txt."
         ),
     )
     parser.add_argument(
@@ -1835,7 +1997,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_TTS_BACKEND,
         help=(
-            "Backend to use: moss-delay, moss-local, qwen, or auto "
+            "Backend to use: moss-delay, moss-local, moss-ttsd, qwen, or auto "
             f"(default: {DEFAULT_TTS_BACKEND})."
         ),
     )
@@ -2002,6 +2164,13 @@ def main() -> int:
         reference_audio = str(selected_audio)
         print(f"Selected reference audio: {reference_audio}")
 
+    speaker2_reference_audio = (
+        args.speaker2_reference_audio or state.get("speaker2_reference_audio")
+    )
+    speaker_tags_enabled = bool(
+        args.speaker_tags or state.get("speaker_tags") or speaker2_reference_audio
+    )
+
     auto_reference_text_file = find_matching_reference_text_file(reference_audio)
     auto_reference_text_path_hint = ""
     if not auto_reference_text_file:
@@ -2024,6 +2193,26 @@ def main() -> int:
         reference_text = read_text_file(auto_reference_text_file).strip()
     else:
         reference_text = ""
+
+    auto_speaker2_reference_text_file: Path | None = None
+    if speaker2_reference_audio:
+        auto_speaker2_reference_text_file = find_matching_reference_text_file(
+            str(speaker2_reference_audio)
+        )
+    if args.speaker2_reference_text_file:
+        speaker2_reference_text = read_text_file(args.speaker2_reference_text_file.resolve()).strip()
+    elif args.speaker2_reference_text:
+        speaker2_reference_text = args.speaker2_reference_text.strip()
+    elif state.get("speaker2_reference_text"):
+        speaker2_reference_text = str(state["speaker2_reference_text"]).strip()
+    elif state.get("speaker2_reference_text_file"):
+        speaker2_reference_text = read_text_file(
+            Path(state["speaker2_reference_text_file"]).resolve()
+        ).strip()
+    elif auto_speaker2_reference_text_file:
+        speaker2_reference_text = read_text_file(auto_speaker2_reference_text_file).strip()
+    else:
+        speaker2_reference_text = ""
 
     requested_backend = (
         str(state.get("tts_backend"))
@@ -2049,11 +2238,26 @@ def main() -> int:
     if (
         args.model_id == DEFAULT_MODEL_ID
         and not (is_resume and state.get("model_id"))
-        and normalize_tts_backend(args.tts_backend) in {"qwen", "moss-delay", "moss-local"}
+        and normalize_tts_backend(args.tts_backend) in {"qwen", "moss-delay", "moss-local", "moss-ttsd"}
     ):
         model_id = recommended_default_model_id(tts_backend)
 
+    if is_moss_ttsd_backend(tts_backend) and args.speaker_tags:
+        print(
+            "WARNING: --speaker-tags custom split mode is ignored for moss-ttsd; "
+            "native [S1]/[S2] dialogue tags are passed through to the model.",
+            file=sys.stderr,
+        )
+    if is_moss_ttsd_backend(tts_backend):
+        speaker_tags_enabled = False
+
     x_vector_only_mode = bool(args.x_vector_only_mode or state.get("x_vector_only_mode"))
+    if speaker_tags_enabled and tts_backend == "qwen":
+        print(
+            "ERROR: [S1]/[S2] speaker tags are supported only for MOSS backends.",
+            file=sys.stderr,
+        )
+        return 2
     if tts_backend == "qwen" and not x_vector_only_mode and not reference_text:
         auto_hint = (
             f" (also looked for auto transcript: {auto_reference_text_path_hint})"
@@ -2103,9 +2307,15 @@ def main() -> int:
         and state.get("continuation_anchor_seconds") is not None
         else float(args.continuation_anchor_seconds)
     )
-    if continuation_chain and not is_moss_backend(tts_backend):
+    if continuation_chain and not is_moss_classic_backend(tts_backend):
         print(
             "ERROR: --continuation-chain is supported only with moss-delay or moss-local backends.",
+            file=sys.stderr,
+        )
+        return 2
+    if continuation_chain and speaker_tags_enabled:
+        print(
+            "ERROR: --continuation-chain cannot be combined with [S1]/[S2] speaker-tag mode.",
             file=sys.stderr,
         )
         return 2
@@ -2121,6 +2331,39 @@ def main() -> int:
         if conversion_note:
             print(f"WARNING: {conversion_note}", file=sys.stderr)
         reference_audio = prepared_reference_audio
+        if speaker2_reference_audio:
+            try:
+                prepared_speaker2_audio, speaker2_conversion_note = prepare_reference_audio_for_moss(
+                    reference_audio=str(speaker2_reference_audio),
+                    run_dir=run_dir,
+                )
+            except RuntimeError as prep_exc:
+                print(f"ERROR: {prep_exc}", file=sys.stderr)
+                return 2
+            if speaker2_conversion_note:
+                print(f"WARNING: {speaker2_conversion_note}", file=sys.stderr)
+            speaker2_reference_audio = prepared_speaker2_audio
+    if is_moss_ttsd_backend(tts_backend):
+        if not speaker2_reference_audio:
+            print(
+                "ERROR: moss-ttsd native dialogue mode requires --speaker2-reference-audio.",
+                file=sys.stderr,
+            )
+            return 2
+        if not reference_text.strip():
+            print(
+                "ERROR: moss-ttsd native dialogue mode requires a transcript for --reference-audio "
+                "(use --reference-text or --reference-text-file).",
+                file=sys.stderr,
+            )
+            return 2
+        if not speaker2_reference_text.strip():
+            print(
+                "ERROR: moss-ttsd native dialogue mode requires a transcript for --speaker2-reference-audio "
+                "(use --speaker2-reference-text or --speaker2-reference-text-file).",
+                file=sys.stderr,
+            )
+            return 2
     inference_batch_size = (
         int(state["inference_batch_size"])
         if is_resume
@@ -2201,9 +2444,20 @@ def main() -> int:
         if candidate.exists():
             reference_text_file = candidate
 
+    speaker2_reference_text_file: Path | None = None
+    if speaker2_reference_text:
+        speaker2_reference_text_file = run_dir / "speaker2_reference_text.txt"
+        write_text_file(speaker2_reference_text_file, speaker2_reference_text + "\n")
+    elif state.get("speaker2_reference_text_file"):
+        candidate = Path(state["speaker2_reference_text_file"]).resolve()
+        if candidate.exists():
+            speaker2_reference_text_file = candidate
+
     source_text = read_text_file(text_file)
     chapter_titles_from_text = extract_chapter_titles_from_raw_text(source_text)
-    paragraphs = split_into_paragraphs(source_text)
+    paragraphs = split_into_paragraphs(
+        source_text, split_speaker_tags=speaker_tags_enabled
+    )
     if not paragraphs:
         print(f"ERROR: no usable paragraphs found in {text_file}.", file=sys.stderr)
         return 2
@@ -2211,7 +2465,20 @@ def main() -> int:
         paragraphs,
         max_chars,
         chapter_titles=chapter_titles_from_text,
+        enable_speaker_tags=speaker_tags_enabled,
     )
+    if speaker_tags_enabled and any(batch.speaker_id == 2 for batch in batches) and not speaker2_reference_audio:
+        print(
+            "ERROR: Text contains [S2] batches but --speaker2-reference-audio was not provided.",
+            file=sys.stderr,
+        )
+        return 2
+    if is_moss_ttsd_backend(tts_backend):
+        if "[S1]" not in source_text.upper() or "[S2]" not in source_text.upper():
+            print(
+                "WARNING: moss-ttsd native dialogue mode works best when the text includes both [S1] and [S2] tags.",
+                file=sys.stderr,
+            )
 
     part_files: list[str] = list(state.get("part_files", []))
     for existing_part in resolve_paths(run_dir, part_files):
@@ -2268,9 +2535,29 @@ def main() -> int:
     if len(saved_batch_chars) > existing_batches:
         saved_batch_chars = saved_batch_chars[:existing_batches]
 
+    raw_saved_batch_speaker_ids = state.get("batch_speaker_ids", [])
+    saved_batch_speaker_ids: list[int] = []
+    if isinstance(raw_saved_batch_speaker_ids, list):
+        for value in raw_saved_batch_speaker_ids[:existing_batches]:
+            try:
+                speaker_num = int(value)
+            except (TypeError, ValueError):
+                speaker_num = 0
+            saved_batch_speaker_ids.append(speaker_num if speaker_num in {1, 2} else 0)
+    if len(saved_batch_speaker_ids) < existing_batches:
+        saved_batch_speaker_ids.extend([0] * (existing_batches - len(saved_batch_speaker_ids)))
+    if len(saved_batch_speaker_ids) > existing_batches:
+        saved_batch_speaker_ids = saved_batch_speaker_ids[:existing_batches]
+
     new_batch_chars = [batch.char_count for batch in batches]
+    new_batch_speaker_ids = [
+        int(batch.speaker_id or infer_speaker_id_from_dialogue_text(batch.text) or 0)
+        for batch in batches
+    ]
     all_batch_chars_for_view = saved_batch_chars + new_batch_chars
+    all_batch_speaker_ids_for_view = saved_batch_speaker_ids + new_batch_speaker_ids
     state_batch_chars = list(saved_batch_chars)
+    state_batch_speaker_ids = list(saved_batch_speaker_ids)
     new_chapter_batches_for_view = [
         existing_batches + index
         for index, batch in enumerate(batches, start=1)
@@ -2322,6 +2609,7 @@ def main() -> int:
         enabled=not args.no_defrag_ui,
         batch_char_counts=all_batch_chars_for_view,
         batch_boundary_types=batch_boundary_types_for_view,
+        batch_speaker_ids=all_batch_speaker_ids_for_view,
     )
     progress.start()
     run_started_at = time.time()
@@ -2356,6 +2644,11 @@ def main() -> int:
         if context:
             line += f" | {context}"
         print(line)
+
+    def reference_audio_for_batch(batch: TextBatch) -> str:
+        if batch.speaker_id == 2 and speaker2_reference_audio:
+            return str(speaker2_reference_audio)
+        return str(reference_audio)
 
     try:
         np, sf, torch, Qwen3TTSModel, AutoModel, AutoProcessor = require_runtime_dependencies(
@@ -2423,6 +2716,9 @@ def main() -> int:
         model: Any
         processor: Any | None = None
         clone_prompt: Any | None = None
+        ttsd_prompt_audio_paths: list[str] | None = None
+        ttsd_prompt_texts: list[str] | None = None
+        ttsd_speaker_features: list[Any] | None = None
         torch_device = torch.device("cpu")
         sample_rate_hint: int | None = None
         if is_moss_backend(tts_backend):
@@ -2481,6 +2777,41 @@ def main() -> int:
             sample_rate_hint = int(
                 getattr(getattr(processor, "model_config", None), "sampling_rate", 24000)
             )
+            if is_moss_ttsd_backend(tts_backend):
+                if not hasattr(processor, "extract_speaker"):
+                    raise RuntimeError(
+                        "moss-ttsd processor is missing extract_speaker(); use a supported MOSS-TTSD model/version."
+                    )
+                if not hasattr(processor, "build_user_message") or not hasattr(
+                    processor, "build_assistant_message"
+                ):
+                    raise RuntimeError(
+                        "moss-ttsd processor is missing chat message helpers; use a supported MOSS-TTSD model/version."
+                    )
+                ttsd_prompt_audio_paths = [str(reference_audio), str(speaker2_reference_audio)]
+                ttsd_prompt_texts = [reference_text.strip(), speaker2_reference_text.strip()]
+                ttsd_speaker_features = []
+                emit_status("Preparing native MOSS dialogue speaker features...")
+                for prompt_audio_path, prompt_text_value in zip(
+                    ttsd_prompt_audio_paths, ttsd_prompt_texts
+                ):
+                    try:
+                        speaker_audio, speaker_sr = sf.read(prompt_audio_path, always_2d=True)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Could not load TTSD speaker reference audio '{prompt_audio_path}': {exc}"
+                        ) from exc
+                    if speaker_audio.shape[0] <= 0:
+                        raise RuntimeError(
+                            f"TTSD speaker reference audio is empty: {prompt_audio_path}"
+                        )
+                    speaker_audio_mono = speaker_audio.mean(axis=1).astype(np.float32, copy=False)
+                    speaker_features = processor.extract_speaker(
+                        speaker_audio_mono,
+                        prompt_text_value,
+                        sample_rate=int(speaker_sr),
+                    )
+                    ttsd_speaker_features.append(speaker_features)
         else:
             assert Qwen3TTSModel is not None
             try:
@@ -2524,10 +2855,16 @@ def main() -> int:
                 "run_dir": str(run_dir),
                 "source_text_file": str(text_file),
                 "reference_audio": reference_audio,
+                "speaker2_reference_audio": speaker2_reference_audio,
                 "reference_text": reference_text,
+                "speaker2_reference_text": speaker2_reference_text,
                 "reference_text_file": str(reference_text_file)
                 if reference_text_file
                 else None,
+                "speaker2_reference_text_file": str(speaker2_reference_text_file)
+                if speaker2_reference_text_file
+                else None,
+                "speaker_tags": speaker_tags_enabled,
                 "x_vector_only_mode": x_vector_only_mode,
                 "tts_backend": tts_backend,
                 "output_audio": str(output_target),
@@ -2549,6 +2886,7 @@ def main() -> int:
                 "max_new_tokens": max_new_tokens,
                 "part_files": part_files,
                 "batch_char_counts": state_batch_chars,
+                "batch_speaker_ids": state_batch_speaker_ids,
                 "chapter_batch_numbers": state_chapter_batches,
                 "chapter_titles_by_batch": {
                     str(batch_number): title
@@ -2568,7 +2906,10 @@ def main() -> int:
 
         runtime_options = {
             "reference_audio": reference_audio,
+            "speaker2_reference_audio": speaker2_reference_audio,
             "reference_text_file": reference_text_file,
+            "speaker2_reference_text_file": speaker2_reference_text_file,
+            "speaker_tags": speaker_tags_enabled,
             "tts_backend": tts_backend,
             "output_wav": output_target,
             "max_chars_per_batch": max_chars,
@@ -2591,7 +2932,7 @@ def main() -> int:
         }
         script_path = Path(__file__).resolve()
         continuation_anchor_dir = run_dir / "continuation_anchors"
-        if continuation_chain and is_moss_backend(tts_backend):
+        if continuation_chain and is_moss_classic_backend(tts_backend):
             (
                 continuation_audio_source,
                 continuation_prefix_text,
@@ -2630,6 +2971,13 @@ def main() -> int:
                     f"batches {first_global_batch}-{last_global_batch}/{total_batches} "
                     f"({group_char_count} chars total)"
                 )
+            group_speakers = sorted(
+                {int(batch.speaker_id) for batch in active_batches if batch.speaker_id in {1, 2}}
+            )
+            if len(group_speakers) == 1:
+                batch_label += f", S{group_speakers[0]}"
+            elif len(group_speakers) > 1:
+                batch_label += ", S1+S2"
 
             progress.set_active_batch(
                 first_global_batch,
@@ -2643,7 +2991,107 @@ def main() -> int:
                 emit_progress(f"started {batch_label}")
 
             def run_generation_group() -> tuple[list[Any], int]:
-                if is_moss_backend(tts_backend):
+                if is_moss_ttsd_backend(tts_backend):
+                    assert processor is not None
+                    assert ttsd_prompt_audio_paths is not None
+                    assert ttsd_prompt_texts is not None
+                    assert ttsd_speaker_features is not None
+
+                    conversations = []
+                    for current_batch in active_batches:
+                        user_message = processor.build_user_message(
+                            text=current_batch.text,
+                            prompt_audio=ttsd_prompt_audio_paths,
+                            prompt_text=ttsd_prompt_texts,
+                        )
+                        assistant_message = processor.build_assistant_message(
+                            speaker_features=ttsd_speaker_features
+                        )
+                        conversations.append([user_message, assistant_message])
+
+                    def decode_ttsd_audio_messages(decoded_items: Any) -> list[Any]:
+                        items = list(decoded_items) if isinstance(decoded_items, (list, tuple)) else [decoded_items]
+                        audio_list: list[Any] = []
+                        for item in items:
+                            audio_obj: Any | None = None
+                            if hasattr(item, "content"):
+                                try:
+                                    content_items = list(getattr(item, "content") or [])
+                                except Exception:
+                                    content_items = []
+                                for content in reversed(content_items):
+                                    if hasattr(content, "audio_url"):
+                                        audio_obj = getattr(content, "audio_url")
+                                        if audio_obj is not None:
+                                            break
+                            if audio_obj is None and hasattr(item, "audio_url"):
+                                audio_obj = getattr(item, "audio_url")
+                            if audio_obj is None:
+                                raise RuntimeError(
+                                    "MOSS-TTSD decode returned an item without audio content."
+                                )
+                            if isinstance(audio_obj, (str, Path)):
+                                audio_arr, _decoded_sr = sf.read(str(audio_obj), always_2d=True)
+                                audio_obj = audio_arr.reshape(-1)
+                            if hasattr(audio_obj, "detach"):
+                                audio_obj = audio_obj.detach().float().cpu().numpy()
+                            else:
+                                audio_obj = np.asarray(audio_obj, dtype=np.float32)
+                            if getattr(audio_obj, "ndim", 1) > 1:
+                                audio_obj = audio_obj.reshape(-1)
+                            audio_list.append(audio_obj)
+                        return audio_list
+
+                    def generate_and_decode_ttsd_messages() -> list[Any]:
+                        packed = processor(conversations, mode="batch")
+                        model_inputs: dict[str, Any] = {}
+                        for key, value in packed.items():
+                            if hasattr(torch, "Tensor") and isinstance(value, torch.Tensor):
+                                model_inputs[key] = value.to(torch_device)
+                            else:
+                                model_inputs[key] = value
+                        outputs = model.generate(
+                            **model_inputs,
+                            max_new_tokens=max_new_tokens,
+                        )
+                        decode_fn = getattr(processor, "decode", None)
+                        if callable(decode_fn):
+                            try:
+                                decoded = decode_fn(
+                                    outputs,
+                                    sampling_rate=int(sample_rate_hint or 24000),
+                                )
+                            except TypeError:
+                                decoded = decode_fn(outputs)
+                        elif hasattr(processor, "batch_decode") and callable(processor.batch_decode):
+                            decoded = processor.batch_decode(outputs)
+                        else:
+                            raise RuntimeError(
+                                "MOSS-TTSD processor does not provide decode/batch_decode."
+                            )
+                        return decode_ttsd_audio_messages(decoded)
+
+                    if progress.enabled:
+                        capture_stream = LineCaptureStream(
+                            on_line=progress.set_backend_status,
+                            fallback_stream=getattr(sys, "__stdout__", None) or sys.stdout,
+                        )
+                        with contextlib.redirect_stdout(capture_stream), contextlib.redirect_stderr(
+                            capture_stream
+                        ):
+                            generated_audio = generate_and_decode_ttsd_messages()
+                        capture_stream.flush()
+                    else:
+                        generated_audio = generate_and_decode_ttsd_messages()
+
+                    if not generated_audio or len(generated_audio) != len(active_batches):
+                        raise RuntimeError(
+                            "MOSS-TTSD decode output size mismatch with requested batch size."
+                        )
+                    output_sample_rate = int(sample_rate_hint or 24000)
+                    return generated_audio, output_sample_rate
+
+                if is_moss_classic_backend(tts_backend):
                     assert processor is not None
                     if continuation_chain:
                         if len(active_batches) != 1:
@@ -2658,7 +3106,7 @@ def main() -> int:
                         )
                         message_kwargs: dict[str, Any] = {
                             "text": continuation_text,
-                            "reference": [reference_audio],
+                            "reference": [reference_audio_for_batch(current_batch)],
                         }
                         if language.lower() != "auto":
                             message_kwargs["language"] = language
@@ -2676,7 +3124,7 @@ def main() -> int:
                         for current_batch in active_batches:
                             message_kwargs = {
                                 "text": current_batch.text,
-                                "reference": [reference_audio],
+                                "reference": [reference_audio_for_batch(current_batch)],
                             }
                             if language.lower() != "auto":
                                 message_kwargs["language"] = language
@@ -2852,7 +3300,7 @@ def main() -> int:
                 part_path = parts_dir / f"batch_{global_batch:05d}.wav"
                 sf.write(str(part_path), audio_data, sample_rate)
                 part_files.append(str(part_path.relative_to(run_dir).as_posix()))
-                if continuation_chain and is_moss_backend(tts_backend):
+                if continuation_chain and is_moss_classic_backend(tts_backend):
                     (
                         continuation_audio_source,
                         continuation_prefix_text,
@@ -2870,6 +3318,9 @@ def main() -> int:
                 completed_this_run += 1
                 completed_chars_total += batch.char_count
                 state_batch_chars.append(batch.char_count)
+                state_batch_speaker_ids.append(
+                    int(batch.speaker_id or infer_speaker_id_from_dialogue_text(batch.text) or 0)
+                )
                 if batch.starts_chapter:
                     state_chapter_batches.append(global_batch)
                     chapter_title = sanitize_chapter_title(batch.chapter_title)
@@ -2883,6 +3334,7 @@ def main() -> int:
 
                 state["part_files"] = part_files
                 state["batch_char_counts"] = state_batch_chars
+                state["batch_speaker_ids"] = state_batch_speaker_ids
                 state["chapter_batch_numbers"] = state_chapter_batches
                 state["chapter_titles_by_batch"] = {
                     str(batch_number): title

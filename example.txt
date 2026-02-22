@@ -14,7 +14,7 @@ python audiobook_qwen3.py \
   --no-defrag-ui
 
 python audiobook_qwen3.py \
-  --text-file todo/troop-test.txt \
+  --text-file todo/ExistentialPhysics.txt \
   --reference-audio FrankieTreadaway.mp3 \
   --tts-backend moss-delay \
   --model-id OpenMOSS-Team/MOSS-TTS \

@@ -10,6 +10,7 @@ Qwen3-TTS is still supported as a fallback backend.
 - Voice cloning with either:
   - `moss-delay` (default, production/long-form focused)
   - `moss-local` (smaller model)
+  - `moss-ttsd` (native 2-speaker dialogue/conversation model)
   - `qwen` (legacy compatibility)
 - Paragraph-aware batching with `[BREAK]` and `[CHAPTER]` control tags.
 - Auto-tuned inference grouping for MOSS (`--inference-batch-size 0`).
@@ -77,6 +78,34 @@ python audiobook_qwen3.py \
 
 Note: run this in your Qwen-specific environment if MOSS deps are also installed elsewhere.
 
+## Native Dialogue Example (MOSS-TTSD)
+
+This mode uses MOSS's built-in dialogue/conversation handling (native `[S1]` / `[S2]` tags).
+
+```bash
+python audiobook_qwen3.py \
+  --text-file /path/dialogue.txt \
+  --tts-backend moss-ttsd \
+  --model-id OpenMOSS-Team/MOSS-TTSD-v1.0 \
+  --reference-audio /path/speaker1.wav \
+  --reference-text-file /path/speaker1.txt \
+  --speaker2-reference-audio /path/speaker2.wav \
+  --speaker2-reference-text-file /path/speaker2.txt \
+  --output /path/dialogue_audiobook.mp3
+```
+
+Example `dialogue.txt`:
+
+```text
+[S1] Hello, are you there?
+[S2] Yes, I'm here.
+[S1] Great. Let's begin.
+```
+
+Transcript auto-load behavior (same as single-speaker mode):
+- If `--reference-text-file` / `--reference-text` is omitted, the app will try `<reference-audio-basename>.txt`.
+- If `--speaker2-reference-text-file` / `--speaker2-reference-text` is omitted, the app will try `<speaker2-reference-audio-basename>.txt`.
+
 ## Best-Quality Long-Form Mode (MOSS)
 
 For maximum continuity (slower), enable continuation chaining:
@@ -104,13 +133,17 @@ Then open `http://127.0.0.1:7860`.
 
 ## Key Arguments
 
-- `--tts-backend`: `moss-delay`, `moss-local`, `qwen`, or `auto`.
+- `--tts-backend`: `moss-delay`, `moss-local`, `moss-ttsd`, `qwen`, or `auto`.
 - `--model-id`: model id/path for selected backend.
 - `--reference-audio`: reference speech file/URL/path.
   - For MOSS backends, local compressed files (e.g. `.mp3`, `.m4a`) are auto-converted to WAV via `ffmpeg`.
 - `--reference-text` / `--reference-text-file`:
   - Required for `qwen` unless `--x-vector-only-mode` is set.
   - Optional for MOSS backends.
+- `--speaker2-reference-audio`: second speaker reference audio (used by `moss-ttsd` native dialogue mode).
+- `--speaker2-reference-text` / `--speaker2-reference-text-file`:
+  - Used by `moss-ttsd` native dialogue mode.
+  - If omitted, app will try matching `<speaker2-reference-audio-basename>.txt`.
 - `--max-chars-per-batch`: text chunk size.
 - `--inference-batch-size`:
   - `0` = auto (recommended for MOSS).
@@ -131,6 +164,7 @@ Then open `http://127.0.0.1:7860`.
 
 - `[BREAK]`: force a hard batch split.
 - `[CHAPTER]`: force split and mark next spoken batch as chapter start.
+- `[S1]` / `[S2]`: native dialogue speaker tags for `moss-ttsd`.
 
 If `--use-chapters` is enabled, chapter times are embedded in final MP3 metadata.
 

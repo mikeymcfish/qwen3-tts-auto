@@ -41,6 +41,10 @@ class BackendAndBatchSizeTests(unittest.TestCase):
             "moss-local",
         )
         self.assertEqual(
+            resolve_tts_backend("auto", "OpenMOSS-Team/MOSS-TTSD-v1.0"),
+            "moss-ttsd",
+        )
+        self.assertEqual(
             resolve_tts_backend("auto", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
             "qwen",
         )
@@ -79,6 +83,17 @@ class BackendAndBatchSizeTests(unittest.TestCase):
         self.assertEqual(size, 1)
         self.assertIsNotNone(warning)
 
+    def test_moss_ttsd_forces_inference_batch_size_to_one(self) -> None:
+        size, warning = choose_inference_batch_size(
+            requested=4,
+            backend="moss-ttsd",
+            torch=_FakeTorch(cuda_available=True, total_memory_gb=48.0),
+            device="cuda:0",
+            max_chars_per_batch=1800,
+        )
+        self.assertEqual(size, 1)
+        self.assertIsNotNone(warning)
+
     def test_cuda_oom_detector(self) -> None:
         self.assertTrue(is_cuda_oom_error(RuntimeError("CUDA out of memory.")))
         self.assertTrue(is_cuda_oom_error(RuntimeError("CUBLAS_STATUS_ALLOC_FAILED")))
@@ -97,6 +112,14 @@ class BackendAndBatchSizeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             apply_continuation_chain_constraints(
                 backend="qwen",
+                continuation_chain=True,
+                inference_batch_size=1,
+            )
+
+    def test_continuation_chain_rejects_moss_ttsd_backend(self) -> None:
+        with self.assertRaises(ValueError):
+            apply_continuation_chain_constraints(
+                backend="moss-ttsd",
                 continuation_chain=True,
                 inference_batch_size=1,
             )

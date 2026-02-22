@@ -22,6 +22,13 @@ class BatchingTests(unittest.TestCase):
             ["Para one", "[BREAK]", "para two", "[CHAPTER]", "Para three"],
         )
 
+    def test_split_into_paragraphs_extracts_speaker_tags_when_enabled(self) -> None:
+        text = "Intro [S1] Hello there. [S2] General Kenobi."
+        self.assertEqual(
+            split_into_paragraphs(text, split_speaker_tags=True),
+            ["Intro", "[S1]", "Hello there.", "[S2]", "General Kenobi."],
+        )
+
     def test_extract_chapter_titles_from_raw_text(self) -> None:
         text = (
             "Intro\n"
@@ -88,6 +95,22 @@ class BatchingTests(unittest.TestCase):
         self.assertTrue(batches[1].starts_chapter)
         self.assertTrue(batches[1].forced_break_before)
         self.assertEqual(batches[1].chapter_title, "Second block.")
+
+    def test_speaker_tags_assign_batch_speakers_and_force_turn_boundaries(self) -> None:
+        paragraphs = split_into_paragraphs(
+            "[S1] Hello there.\n\n[S2]\nGeneral Kenobi.\n\n[S1] You are a bold one.",
+            split_speaker_tags=True,
+        )
+        batches = build_batches(
+            paragraphs,
+            max_chars_per_batch=500,
+            enable_speaker_tags=True,
+        )
+        self.assertEqual([batch.speaker_id for batch in batches], [1, 2, 1])
+        self.assertEqual(
+            [batch.text for batch in batches],
+            ["Hello there.", "General Kenobi.", "You are a bold one."],
+        )
 
 
 if __name__ == "__main__":
