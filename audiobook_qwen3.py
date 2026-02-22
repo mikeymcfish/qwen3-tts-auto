@@ -2821,8 +2821,21 @@ def main() -> int:
 
                     prompt_wavs = [load_resampled_prompt_wav(path) for path in ttsd_prompt_audio_paths]
                     prompt_concat = torch.cat(prompt_wavs, dim=-1)
-                    ttsd_reference_audio_codes = processor.encode_audios_from_wav(prompt_wavs)
-                    ttsd_concat_prompt_audio_code = processor.encode_audios_from_wav([prompt_concat])[0]
+
+                    def encode_ttsd_prompt_audio_codes(wavs: list[Any]) -> Any:
+                        try:
+                            return processor.encode_audios_from_wav(
+                                wavs,
+                                sampling_rate=target_sr,
+                            )
+                        except TypeError:
+                            try:
+                                return processor.encode_audios_from_wav(wavs, target_sr)
+                            except TypeError:
+                                return processor.encode_audios_from_wav(wavs)
+
+                    ttsd_reference_audio_codes = encode_ttsd_prompt_audio_codes(prompt_wavs)
+                    ttsd_concat_prompt_audio_code = encode_ttsd_prompt_audio_codes([prompt_concat])[0]
                 elif hasattr(processor, "extract_speaker"):
                     # Fallback for alternate/older TTSD-style processors.
                     ttsd_speaker_features = []
