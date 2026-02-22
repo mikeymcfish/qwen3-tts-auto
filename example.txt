@@ -14,12 +14,11 @@ python audiobook_qwen3.py \
   --no-defrag-ui
 
 python audiobook_qwen3.py \
-  --text-file BuddhismandTheTwelve.txt \
-  --reference-audio GrahamVerchere.mp3 \
+  --text-file todo/troop-test.txt \
+  --reference-audio FrankieTreadaway.mp3 \
   --tts-backend moss-delay \
   --model-id OpenMOSS-Team/MOSS-TTS \
-  --continuation-chain \
-  --inference-batch-size 1 \
+  --inference-batch-size 0 \
   --max-chars-per-batch 2200 \
-  --pause-ms 0 \
-  --no-defrag-ui
+  --pause-ms 50 \
+  --output TheTroop.mp3 

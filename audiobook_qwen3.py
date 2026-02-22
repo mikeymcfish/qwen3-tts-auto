@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import importlib
 import importlib.util
 import json
@@ -69,6 +70,66 @@ class TextBatch:
     starts_chapter: bool = False
     forced_break_before: bool = False
     chapter_title: str | None = None
+
+
+class LineCaptureStream:
+    """Line-buffered text sink that forwards backend chatter into the defrag UI."""
+
+    def __init__(
+        self,
+        on_line: Callable[[str], None],
+        fallback_stream: TextIOBase | Any | None = None,
+    ) -> None:
+        self._on_line = on_line
+        self._fallback_stream = fallback_stream
+        self._buffer = ""
+        self.encoding = getattr(fallback_stream, "encoding", "utf-8")
+        self.errors = getattr(fallback_stream, "errors", "replace")
+
+    def write(self, data: str | Any) -> int:
+        text = data if isinstance(data, str) else str(data)
+        if not text:
+            return 0
+        self._buffer += text
+        self._drain_complete_lines()
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buffer:
+            self._emit(self._buffer)
+            self._buffer = ""
+
+    def writable(self) -> bool:
+        return True
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        if self._fallback_stream is None:
+            raise OSError("Captured stream has no file descriptor.")
+        return self._fallback_stream.fileno()
+
+    def _drain_complete_lines(self) -> None:
+        start = 0
+        idx = 0
+        while idx < len(self._buffer):
+            ch = self._buffer[idx]
+            if ch in "\r\n":
+                self._emit(self._buffer[start:idx])
+                if ch == "\r" and idx + 1 < len(self._buffer) and self._buffer[idx + 1] == "\n":
+                    idx += 1
+                start = idx + 1
+            idx += 1
+        if start:
+            self._buffer = self._buffer[start:]
+
+    def _emit(self, line: str) -> None:
+        # Strip ANSI control sequences before showing the message inside the TUI.
+        clean = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", line or "")
+        clean = " ".join(clean.split())
+        if clean:
+            self._on_line(clean)
 
 
 def normalize_tts_backend(value: str) -> str:
@@ -669,6 +730,7 @@ class DefragProgressView:
         self.active_batch_end = 0
         self.stop_requested = False
         self.status = "Loading model..."
+        self.backend_status = ""
         self._batch_durations: list[float] = []
         self._start_time = time.time()
         self._tick = 0
@@ -678,6 +740,7 @@ class DefragProgressView:
         self._done_flash_until: dict[int, float] = {}
         self._alt_buffer_active = False
         self._last_lines: list[str] = []
+        self._output_stream: TextIOBase | Any = getattr(sys, "__stdout__", None) or sys.stdout
 
         if batch_char_counts and len(batch_char_counts) == self.total_batches:
             normalized = [max(1, int(v)) for v in batch_char_counts]
@@ -703,8 +766,8 @@ class DefragProgressView:
         if not self.enabled:
             return
         # Use alternate screen buffer to avoid visible flicker in normal terminal history.
-        sys.stdout.write("\x1b[?1049h\x1b[H\x1b[?25l")
-        sys.stdout.flush()
+        self._output_stream.write("\x1b[?1049h\x1b[H\x1b[?25l")
+        self._output_stream.flush()
         self._alt_buffer_active = True
         self._thread = threading.Thread(target=self._render_loop, daemon=True)
         self._thread.start()
@@ -712,6 +775,15 @@ class DefragProgressView:
     def set_status(self, message: str) -> None:
         with self._lock:
             self.status = message
+
+    def set_backend_status(self, message: str) -> None:
+        clean = " ".join(str(message or "").split())
+        if not clean:
+            return
+        if len(clean) > 120:
+            clean = clean[:117] + "..."
+        with self._lock:
+            self.backend_status = clean
 
     def set_active_batch(
         self,
@@ -780,11 +852,11 @@ class DefragProgressView:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=1.5)
-        sys.stdout.write("\x1b[?25h")
+        self._output_stream.write("\x1b[?25h")
         if self._alt_buffer_active:
-            sys.stdout.write("\x1b[?1049l")
+            self._output_stream.write("\x1b[?1049l")
             self._alt_buffer_active = False
-        sys.stdout.flush()
+        self._output_stream.flush()
 
     def _render_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -804,11 +876,11 @@ class DefragProgressView:
             old_line = self._last_lines[row_index] if row_index < len(self._last_lines) else None
             if new_line == old_line:
                 continue
-            sys.stdout.write(f"\x1b[{row_index + 1};1H")
-            sys.stdout.write(new_line)
-            sys.stdout.write("\x1b[K")
+            self._output_stream.write(f"\x1b[{row_index + 1};1H")
+            self._output_stream.write(new_line)
+            self._output_stream.write("\x1b[K")
         self._last_lines = lines
-        sys.stdout.flush()
+        self._output_stream.flush()
 
     def _build_frame(self) -> str:
         with self._lock:
@@ -818,6 +890,7 @@ class DefragProgressView:
             active_start = self.active_batch_start
             active_end = self.active_batch_end
             status = self.status
+            backend_status = self.backend_status
             stop_requested = self.stop_requested
             done_flash_until = dict(self._done_flash_until)
             avg_batch_seconds = (
@@ -853,6 +926,21 @@ class DefragProgressView:
         lines: list[str] = []
         line_parts: list[str] = []
         visible_len = 0
+
+        def append_colored_cells(color: str, glyph: str, count: int) -> None:
+            nonlocal line_parts, visible_len
+            remaining = max(0, int(count))
+            while remaining > 0:
+                if visible_len >= blocks_per_row and line_parts:
+                    lines.append("".join(line_parts))
+                    line_parts = []
+                    visible_len = 0
+                capacity = max(1, blocks_per_row - visible_len)
+                take = min(remaining, capacity)
+                line_parts.append(f"{color}{glyph * take}{self.COLOR_RESET}")
+                visible_len += take
+                remaining -= take
+
         for batch_number, block_count in enumerate(self._batch_block_counts, start=1):
             active_batch = active_start <= batch_number <= active_end
             if active_batch:
@@ -871,29 +959,17 @@ class DefragProgressView:
                 color = self.COLOR_RED
                 glyph = self.GLYPH_PENDING
 
-            token = f"{color}{glyph * block_count}{self.COLOR_RESET}"
-            token_visible = block_count
-            if visible_len + token_visible > blocks_per_row and line_parts:
-                lines.append("".join(line_parts))
-                line_parts = []
-                visible_len = 0
-            line_parts.append(token)
-            visible_len += token_visible
+            append_colored_cells(color, glyph, block_count)
 
             if batch_number < self.total_batches:
                 boundary_kind = self._batch_boundary_types[batch_number]
                 if boundary_kind == "chapter":
-                    marker_token = (
-                        f"{self.COLOR_LIGHT_GRAY}{self.GLYPH_CHAPTER}{self.COLOR_RESET}"
-                    )
+                    marker_color = self.COLOR_LIGHT_GRAY
+                    marker_glyph = self.GLYPH_CHAPTER
                 else:
-                    marker_token = f"{self.COLOR_BLACK}{self.GLYPH_BREAK}{self.COLOR_RESET}"
-                if visible_len + 1 > blocks_per_row and line_parts:
-                    lines.append("".join(line_parts))
-                    line_parts = []
-                    visible_len = 0
-                line_parts.append(marker_token)
-                visible_len += 1
+                    marker_color = self.COLOR_BLACK
+                    marker_glyph = self.GLYPH_BREAK
+                append_colored_cells(marker_color, marker_glyph, 1)
         if line_parts:
             lines.append("".join(line_parts))
         if not lines:
@@ -909,6 +985,7 @@ class DefragProgressView:
             f"current {current_batch_label}",
             f"blocks: {completed_blocks}/{total_blocks}  (1 block = {self.CHARS_PER_BLOCK} chars)  grid={blocks_per_row}/row",
             f"status: {self.COLOR_YELLOW}{status}{self.COLOR_RESET}",
+            f"backend: {self.COLOR_DIM}{backend_status or '(quiet)'}{self.COLOR_RESET}",
             f"legend: {self.COLOR_RED}{self.GLYPH_PENDING}{self.COLOR_RESET}=pending  "
             f"{self.COLOR_BLUE}{self.GLYPH_WORKING_A}{self.COLOR_RESET}=working  "
             f"{self.COLOR_GREEN}{self.GLYPH_DONE}{self.COLOR_RESET}=done-now  "
@@ -2608,21 +2685,35 @@ def main() -> int:
                             )
                         mode = "generation"
 
-                    packed = processor(conversations, mode=mode)
-                    input_ids = packed["input_ids"].to(torch_device)
-                    attention_mask = packed["attention_mask"].to(torch_device)
-                    outputs = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        max_new_tokens=max_new_tokens,
-                        audio_temperature=float(DEFAULT_MOSS_AUDIO_TEMPERATURE),
-                        audio_top_p=float(DEFAULT_MOSS_AUDIO_TOP_P),
-                        audio_top_k=int(DEFAULT_MOSS_AUDIO_TOP_K),
-                        audio_repetition_penalty=float(
-                            DEFAULT_MOSS_AUDIO_REPETITION_PENALTY
-                        ),
-                    )
-                    messages = processor.decode(outputs)
+                    def generate_and_decode_moss_messages() -> list[Any]:
+                        packed = processor(conversations, mode=mode)
+                        input_ids = packed["input_ids"].to(torch_device)
+                        attention_mask = packed["attention_mask"].to(torch_device)
+                        outputs = model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            max_new_tokens=max_new_tokens,
+                            audio_temperature=float(DEFAULT_MOSS_AUDIO_TEMPERATURE),
+                            audio_top_p=float(DEFAULT_MOSS_AUDIO_TOP_P),
+                            audio_top_k=int(DEFAULT_MOSS_AUDIO_TOP_K),
+                            audio_repetition_penalty=float(
+                                DEFAULT_MOSS_AUDIO_REPETITION_PENALTY
+                            ),
+                        )
+                        return processor.decode(outputs)
+
+                    if progress.enabled:
+                        capture_stream = LineCaptureStream(
+                            on_line=progress.set_backend_status,
+                            fallback_stream=getattr(sys, "__stdout__", None) or sys.stdout,
+                        )
+                        with contextlib.redirect_stdout(capture_stream), contextlib.redirect_stderr(
+                            capture_stream
+                        ):
+                            messages = generate_and_decode_moss_messages()
+                        capture_stream.flush()
+                    else:
+                        messages = generate_and_decode_moss_messages()
                     expected_messages = 1 if continuation_chain else len(active_batches)
                     if not messages or len(messages) != expected_messages:
                         raise RuntimeError(
