@@ -14,19 +14,13 @@ python audiobook_qwen3.py \
   --no-defrag-ui
 
 python audiobook_qwen3.py \
-  --text-file todo/ExistentialPhysics.txt \
+  --text-file todo/BuddhismAndTwelve.txt \
   --reference-audio FrankieTreadaway.mp3 \
   --tts-backend moss-delay \
   --model-id OpenMOSS-Team/MOSS-TTS \
   --inference-batch-size 0 \
   --max-chars-per-batch 2200 \
   --pause-ms 50 \
-  --output TheTroop.mp3 
-
-  python audiobook_qwen3.py \
-  --text-file test.txt \
-  --tts-backend moss-ttsd \
-  --model-id OpenMOSS-Team/MOSS-TTSD-v1.0 \
-  --reference-audio GrahamVerchere.mp3 \
-  --speaker2-reference-audio MaxJenkins.mp3 \
-  --output test.mp3
+  --use-chapters \
+  --chapter-pause-ms 500 \
+  --output BuddhismAndTwelve.mp3 

@@ -1,0 +1,72 @@
+# YAML runner for `scripts/run_from_yaml.py`
+# Paths are resolved relative to THIS file.
+
+preprocess:
+  enabled: true
+  defaults:
+    overwrite: true
+    target_sample_rate: 24000
+    channels: 1
+    trim_silence: true
+    trim_start_threshold_db: -40
+    trim_stop_threshold_db: -42
+    denoise: afftdn        # options: none | afftdn | arnndn
+    afftdn_noise_reduction: 8
+    afftdn_noise_floor: -35
+    highpass_hz: 70
+    lowpass_hz: 0
+    compressor: false
+    loudnorm: true
+    target_lufs: -20
+    target_lra: 7
+    true_peak_db: -1.5
+    limiter: true
+    limiter_limit: 0.95
+    suffix: _prep
+    output_dir: refs_prepped
+  files:
+    - name: narrator
+      input: refs/voice_ref.wav
+      assign_to: reference_audio
+      # output: refs_prepped/voice_ref_prep.wav   # optional explicit output path
+    # - name: speaker2
+    #   input: refs/speaker2.wav
+    #   assign_to: speaker2_reference_audio
+
+audiobook:
+  enabled: true
+  script: audiobook_qwen3.py
+  # python: .venv/Scripts/python.exe  # optional override
+  args:
+    text_file: input/book.txt
+    output: output/book_audiobook.mp3
+    run_root: runs
+
+    # Preprocess stage will overwrite `reference_audio` if assign_to is used.
+    reference_audio: refs/voice_ref.wav
+    # reference_text_file: refs/voice_ref.txt   # recommended for qwen / continuation-chain
+
+    # Dialogue / MOSS-TTSD (optional)
+    # speaker2_reference_audio: refs/speaker2.wav
+    # speaker2_reference_text_file: refs/speaker2.txt
+    # speaker_tags: true
+
+    tts_backend: moss-delay   # moss-delay | moss-local | moss-ttsd | qwen | auto
+    model_id: OpenMOSS-Team/MOSS-TTS
+
+    inference_batch_size: 0
+    max_chars_per_batch: 2200
+    pause_ms: 50
+    chapter_pause_ms: 500
+    use_chapters: true
+
+    # Optional quality / runtime knobs
+    mp3_quality: 0
+    max_new_tokens: 2048
+    device: cuda:0
+    dtype: float16
+    attn_implementation: flash_attention_2
+    no_defrag_ui: false
+    continuation_chain: false
+    continuation_anchor_seconds: 8
+    x_vector_only_mode: false

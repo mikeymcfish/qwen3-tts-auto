@@ -1153,10 +1153,21 @@ def create_continue_assets(
     remaining_text_path = run_dir / f"continue_from_batch_{next_batch_number:05d}.txt"
     remaining_segments: list[str] = []
     for batch in remaining_batches:
+        batch_text_for_continue = batch.text
         if batch.starts_chapter:
             chapter_title = sanitize_chapter_title(batch.chapter_title)
             if chapter_title:
                 remaining_segments.append(f"{CHAPTER_TAG} {chapter_title}")
+                # `batch.text` already starts with the title paragraph for inline
+                # `[CHAPTER] Title` inputs. Dropping that duplicate preserves the
+                # original spoken text on resume and keeps later batch/chapter
+                # boundaries stable.
+                split_parts = re.split(r"\n\s*\n+", str(batch_text_for_continue).strip())
+                if split_parts:
+                    first_part = sanitize_chapter_title(split_parts[0])
+                    if first_part == chapter_title:
+                        remaining_tail = [part.strip() for part in split_parts[1:] if part.strip()]
+                        batch_text_for_continue = "\n\n".join(remaining_tail)
             else:
                 remaining_segments.append(CHAPTER_TAG)
         elif batch.forced_break_before:
@@ -1164,7 +1175,8 @@ def create_continue_assets(
         speaker_tag = speaker_tag_for_id(batch.speaker_id)
         if speaker_tag:
             remaining_segments.append(speaker_tag)
-        remaining_segments.append(batch.text)
+        if str(batch_text_for_continue).strip():
+            remaining_segments.append(batch_text_for_continue)
     remaining_text = "\n\n".join(remaining_segments).strip() + "\n"
     write_text_file(remaining_text_path, remaining_text)
 

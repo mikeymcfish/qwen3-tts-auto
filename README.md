@@ -131,6 +131,49 @@ python gradio_app.py
 
 Then open `http://127.0.0.1:7860`.
 
+## YAML Run Config (No Long CLI Commands)
+
+Use the included `run_settings.yaml` with the wrapper script:
+
+```bash
+python scripts/run_from_yaml.py
+```
+
+This can:
+
+- load your audiobook run settings from YAML (`audiobook.args`)
+- optionally preprocess reference clips first (`preprocess.files`)
+- inject the cleaned output paths back into the audiobook command automatically
+
+Dry-run preview (prints commands only):
+
+```bash
+python scripts/run_from_yaml.py --dry-run
+```
+
+## Reference Audio Preprocess Pipeline (Clone Prep)
+
+Conservative ffmpeg-based speech cleanup is included:
+
+```bash
+python scripts/preprocess_reference_audio.py /path/ref.mp3 --output-file /path/ref_prep.wav
+```
+
+Default pipeline (tuned to be gentle):
+
+- mono + resample to 24kHz
+- high-pass filter (70 Hz)
+- light denoise (`afftdn`)
+- trim leading/trailing silence
+- loudness normalize (`loudnorm`)
+- final limiter
+
+Notes:
+
+- Requires `ffmpeg` in `PATH`.
+- Keep denoise/enhancement conservative; over-processing can hurt voice-clone identity.
+- `arnndn` is supported if your ffmpeg build includes it and you provide a model file.
+
 ## Key Arguments
 
 - `--tts-backend`: `moss-delay`, `moss-local`, `moss-ttsd`, `qwen`, or `auto`.

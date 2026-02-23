@@ -6,6 +6,7 @@ einops>=0.8
 psutil>=5.9
 numpy>=1.26
 soundfile>=0.12.1
+PyYAML>=6.0
 hf_transfer
 gradio>=5.0.0
 torchcodec
