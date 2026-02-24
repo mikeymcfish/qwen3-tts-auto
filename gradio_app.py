@@ -342,6 +342,69 @@ def _metric_bar(
     )
 
 
+def _render_compact_progress_strip(
+    *,
+    log_lines: list[str],
+    started_at: float | None,
+    expected_output: Path | None,
+) -> str:
+    progress = _extract_latest_progress(log_lines)
+    phase = _extract_latest_status(log_lines)
+    elapsed = max(0.0, time.time() - started_at) if started_at is not None else 0.0
+    output_path = _find_output_path(expected_output, log_lines)
+
+    last_line = log_lines[-1] if log_lines else ""
+    is_error = bool(last_line.lower().startswith("error:")) or any(
+        line.lower().startswith("error:") for line in log_lines[-5:]
+    )
+
+    pct = 0.0
+    progress_text = "idle"
+    if progress:
+        batch_done = int(progress.get("batch_done", 0) or 0)
+        batch_total = int(progress.get("batch_total", 0) or 0)
+        char_done = int(progress.get("char_done", 0) or 0)
+        char_total = int(progress.get("char_total", 0) or 0)
+        if char_total > 0:
+            pct = (char_done / char_total) * 100.0
+        elif batch_total > 0:
+            pct = (batch_done / batch_total) * 100.0
+        progress_text = f"batches {batch_done}/{batch_total}" if batch_total else f"chars {char_done}/{char_total}"
+        if batch_total and char_total:
+            progress_text = f"batches {batch_done}/{batch_total} | chars {char_done}/{char_total}"
+    elif output_path and output_path.exists():
+        pct = 100.0
+        progress_text = "complete"
+    elif log_lines:
+        pct = 5.0 if started_at is not None else 0.0
+        progress_text = f"{len(log_lines)} log lines"
+
+    pct = max(0.0, min(100.0, pct))
+    phase_text = phase or ("ready" if not log_lines else "running")
+    if output_path and output_path.exists():
+        phase_text = "complete"
+    if is_error:
+        phase_text = "error"
+
+    color = "#ef4444" if is_error else ("#22c55e" if pct >= 100.0 else "#38bdf8")
+    elapsed_text = f"{elapsed:.1f}s" if started_at is not None or log_lines else "0.0s"
+    out_text = output_path.name if output_path and output_path.exists() else "n/a"
+
+    return (
+        "<div class='sticky-progress-shell'>"
+        "<div class='sticky-progress-top'>"
+        f"<span class='sticky-progress-phase'>{html.escape(phase_text)}</span>"
+        f"<span class='sticky-progress-stat'>{html.escape(progress_text)}</span>"
+        f"<span class='sticky-progress-stat'>elapsed {html.escape(elapsed_text)}</span>"
+        f"<span class='sticky-progress-stat'>output {html.escape(out_text)}</span>"
+        "</div>"
+        "<div class='sticky-progress-bar'>"
+        f"<div class='sticky-progress-fill' style='width:{pct:.1f}%; background:{color};'></div>"
+        "</div>"
+        "</div>"
+    )
+
+
 def _render_telemetry_panel(
     *,
     log_lines: list[str],
@@ -1693,6 +1756,36 @@ def _copy_text_or_blank(value: str) -> str:
     return str(value or "")
 
 
+def _select_workflow_tab(tab_id: str) -> dict[str, Any]:
+    return gr.update(selected=tab_id)
+
+
+def _step3_gate_markdown(text_value: str, text_file_value: str | None) -> str:
+    has_text_source = bool(str(text_value or "").strip() or str(text_file_value or "").strip())
+    if has_text_source:
+        source_label = "pasted/edited text" if str(text_value or "").strip() else "uploaded text file"
+        return (
+            "### Step 3 Unlocked\n\n"
+            f"Detected {source_label} from Step 1. You can now configure and run generation."
+        )
+    return (
+        "### Step 3 Locked\n\n"
+        "Add text in Step 1 (paste/edit or upload a `.txt` file) to unlock generation controls."
+    )
+
+
+def _step3_gate_visibility_updates(
+    text_value: str,
+    text_file_value: str | None,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    has_text_source = bool(str(text_value or "").strip() or str(text_file_value or "").strip())
+    return (
+        gr.update(visible=not has_text_source),
+        gr.update(visible=has_text_source),
+        _step3_gate_markdown(text_value, text_file_value),
+    )
+
+
 def run_generation(
     text_input: str,
     text_file: str | None,
@@ -1720,7 +1813,7 @@ def run_generation(
     continuation_chain: bool,
     continuation_anchor_seconds: float,
     stop_after_batch: int,
-) -> Generator[tuple[str, str | None, str | None, str, str], None, None]:
+) -> Generator[tuple[str, str | None, str | None, str, str, str], None, None]:
     log_lines: list[str] = []
     telemetry_cache: dict[str, object] = {}
     run_root_path: Path | None = None
@@ -1749,11 +1842,18 @@ def run_generation(
             cache=telemetry_cache,
         )
 
-    yield _build_status_message("Preparing job..."), None, None, "", telemetry_html()
+    def progress_strip_html() -> str:
+        return _render_compact_progress_strip(
+            log_lines=log_lines,
+            started_at=started,
+            expected_output=expected_output,
+        )
+
+    yield _build_status_message("Preparing job..."), None, None, "", telemetry_html(), progress_strip_html()
 
     if not CLI_SCRIPT.exists():
         message = f"CLI script not found: {CLI_SCRIPT}"
-        yield _build_status_message("Unable to start", message), None, None, message, telemetry_html()
+        yield _build_status_message("Unable to start", message), None, None, message, telemetry_html(), progress_strip_html()
         return
 
     run_root_path = Path(run_root or str(DEFAULT_RUN_ROOT)).expanduser().resolve()
@@ -1788,11 +1888,11 @@ def run_generation(
 
         if not resume_state_path and not text_path:
             message = "Provide book text (paste text or upload a .txt file), or upload a resume state."
-            yield _build_status_message("Missing input", message), None, None, message, telemetry_html()
+            yield _build_status_message("Missing input", message), None, None, message, telemetry_html(), progress_strip_html()
             return
         if not resume_state_path and not reference_audio_value:
             message = "Provide reference audio (upload file or path/URL) for a new run."
-            yield _build_status_message("Missing reference audio", message), None, None, message, telemetry_html()
+            yield _build_status_message("Missing reference audio", message), None, None, message, telemetry_html(), progress_strip_html()
             return
         if (
             reference_audio_file
@@ -1805,7 +1905,7 @@ def run_generation(
                 "Reference transcript is required for uploaded reference audio unless "
                 "X-Vector only mode is enabled."
             )
-            yield _build_status_message("Missing reference transcript", message), None, None, message, telemetry_html()
+            yield _build_status_message("Missing reference transcript", message), None, None, message, telemetry_html(), progress_strip_html()
             return
         if (
             continuation_chain
@@ -1817,7 +1917,7 @@ def run_generation(
                 "Continuation chain mode requires a reference transcript for the initial anchor "
                 "(reference text or transcript file)."
             )
-            yield _build_status_message("Missing continuation transcript", message), None, None, message, telemetry_html()
+            yield _build_status_message("Missing continuation transcript", message), None, None, message, telemetry_html(), progress_strip_html()
             return
 
         if text_path:
@@ -1884,11 +1984,11 @@ def run_generation(
             command.extend(["--stop-after-batch", str(int(stop_after_batch))])
     except Exception as exc:
         message = f"Input preparation failed: {exc}"
-        yield _build_status_message("Unable to prepare job", message), None, None, message, telemetry_html()
+        yield _build_status_message("Unable to prepare job", message), None, None, message, telemetry_html(), progress_strip_html()
         return
 
     push_log(f"$ {' '.join(command)}")
-    yield _build_status_message("Running generation..."), None, None, "\n".join(log_lines), telemetry_html()
+    yield _build_status_message("Running generation..."), None, None, "\n".join(log_lines), telemetry_html(), progress_strip_html()
 
     started = time.time()
     process = subprocess.Popen(
@@ -1904,7 +2004,7 @@ def run_generation(
     if process.stdout:
         for line in process.stdout:
             logs_text = push_log(line.rstrip("\n"))
-            yield _build_status_message("Running generation..."), None, None, logs_text, telemetry_html()
+            yield _build_status_message("Running generation..."), None, None, logs_text, telemetry_html(), progress_strip_html()
 
     exit_code = process.wait()
     elapsed = time.time() - started
@@ -1913,7 +2013,7 @@ def run_generation(
 
     if exit_code != 0:
         detail = f"CLI exited with code {exit_code}. Check logs below."
-        yield _build_status_message("Generation failed", detail), None, None, logs_text, telemetry_html()
+        yield _build_status_message("Generation failed", detail), None, None, logs_text, telemetry_html(), progress_strip_html()
         return
 
     if output_path and output_path.exists():
@@ -1924,6 +2024,7 @@ def run_generation(
             str(output_path),
             logs_text,
             telemetry_html(),
+            progress_strip_html(),
         )
         return
 
@@ -1931,13 +2032,66 @@ def run_generation(
         f"Completed in {elapsed:.1f}s, but output file was not auto-detected. "
         "Review logs for the final path."
     )
-    yield _build_status_message("Generation complete", detail), None, None, logs_text, telemetry_html()
+    yield _build_status_message("Generation complete", detail), None, None, logs_text, telemetry_html(), progress_strip_html()
 
 
 def build_demo() -> gr.Blocks:
     css = """
     .app-shell {max-width: 1200px; margin: 0 auto;}
     .mono-log textarea {font-family: Consolas, "Cascadia Mono", Menlo, monospace !important;}
+    .sticky-progress-wrap {
+        position: sticky;
+        top: 0;
+        z-index: 40;
+        margin-bottom: 10px;
+    }
+    .sticky-progress-wrap > div {
+        background: rgba(248, 250, 252, 0.96);
+        backdrop-filter: blur(8px);
+        border: 1px solid rgba(148, 163, 184, 0.30);
+        border-radius: 12px;
+        padding: 8px 10px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.08);
+    }
+    .sticky-progress-shell {
+        display: grid;
+        gap: 6px;
+    }
+    .sticky-progress-top {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 10px;
+        align-items: center;
+        font-size: 11px;
+        color: #334155;
+    }
+    .sticky-progress-phase {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #e0f2fe;
+        color: #0c4a6e;
+        font-weight: 600;
+        text-transform: lowercase;
+    }
+    .sticky-progress-stat {
+        white-space: nowrap;
+        color: #475569;
+    }
+    .sticky-progress-bar {
+        height: 8px;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.25);
+        overflow: hidden;
+        border: 1px solid rgba(148, 163, 184, 0.20);
+    }
+    .sticky-progress-fill {
+        height: 100%;
+        border-radius: 999px;
+        transition: width 0.16s ease-out;
+        box-shadow: 0 0 12px rgba(56, 189, 248, 0.25);
+    }
     .telemetry-shell {
         border: 1px solid rgba(148, 163, 184, 0.35);
         background: linear-gradient(180deg, rgba(2, 6, 23, 0.92), rgba(15, 23, 42, 0.96));
@@ -2072,6 +2226,9 @@ def build_demo() -> gr.Blocks:
         initial_voice_library_metadata_text,
         initial_voice_library_inspector_status,
     ) = inspect_voice_library_selection_for_preview(initial_voice_library_value)
+    initial_step3_locked_panel_update, initial_step3_controls_panel_update, initial_step3_gate_status_md = (
+        _step3_gate_visibility_updates("", None)
+    )
     chapter_regex_presets = [
         "Common Headings",
         "Chapter Number",
@@ -2089,393 +2246,29 @@ def build_demo() -> gr.Blocks:
     ) as demo:
         gr.Markdown(
             "## MOSS/Qwen Audiobook Studio\n"
-            "Generate audiobooks with chapter tags, pause controls, adaptive inference batching, and MP3 chapter metadata."
+            "Step-by-step audiobook workspace: prepare text, prepare/select voices, run generation, then monitor and post-process."
         )
-        status = gr.Markdown("### Ready")
-        with gr.Row(elem_classes=["app-shell"]):
-            with gr.Column(scale=3):
-                telemetry = gr.HTML(
-                    value=_render_telemetry_panel(
-                        log_lines=[],
-                        command=None,
-                        job_root=None,
-                        run_root=DEFAULT_RUN_ROOT.resolve(),
-                        expected_output=None,
-                        device_hint="cuda:0",
-                        started_at=None,
-                        process_pid=None,
-                        cache={},
-                    )
-                )
-            with gr.Column(scale=2):
-                logs = gr.Textbox(label="Run Log", lines=18, elem_classes=["mono-log"])
 
-        with gr.Row(elem_classes=["app-shell"]):
-            with gr.Column(scale=2):
-                audio_output = gr.Audio(label="Output Preview", type="filepath", interactive=False)
-            with gr.Column(scale=1):
-                file_output = gr.File(label="Download Output", interactive=False)
+        progress_strip = gr.HTML(
+            value=_render_compact_progress_strip(
+                log_lines=[],
+                started_at=None,
+                expected_output=None,
+            ),
+            elem_classes=["app-shell", "sticky-progress-wrap"],
+        )
 
-        with gr.Tabs():
-            with gr.Tab("1. Main Book Generation"):
+        with gr.Tabs(selected="step1_text", elem_classes=["app-shell"]) as workflow_tabs:
+            with gr.Tab("Step 1. Text Editing + Chapter Generation", id="step1_text"):
                 gr.Markdown(
-                    "Primary audiobook generation controls. Edit or load book text in **5. Text Editing + Chapter Generation**, "
-                    "and manage reusable voices in **3. Voice Lab**."
-                )
-                with gr.Row(elem_classes=["app-shell"]):
-                    with gr.Column(scale=2):
-                        gr.Markdown("### Reference Voice + Resume")
-                        reference_audio_file = gr.File(
-                            label="Reference Audio File",
-                            file_types=audio_types,
-                            type="filepath",
-                        )
-                        reference_audio_path = gr.Textbox(
-                            label="Reference Audio Path or URL (optional)",
-                            placeholder="Use this if you do not upload audio.",
-                        )
-                        reference_text = gr.Textbox(
-                            label="Reference Transcript (optional)",
-                            placeholder="Required unless X-Vector only mode is enabled.",
-                            lines=4,
-                        )
-                        reference_text_file = gr.File(
-                            label="Reference Transcript File (.txt)",
-                            file_types=[".txt"],
-                            type="filepath",
-                        )
-                        x_vector_only_mode = gr.Checkbox(
-                            label="X-Vector Only Mode (no transcript required)",
-                            value=False,
-                        )
-                        resume_state_file = gr.File(
-                            label="Resume State (session_state.json, optional)",
-                            file_types=[".json"],
-                            type="filepath",
-                        )
-                        gr.Markdown(
-                            "Use **3. Voice Lab** to browse `/voices`, preview voice files/presets, and import new files."
-                        )
-
-                    with gr.Column(scale=1):
-                        gr.Markdown("### Output + Runtime")
-                        output_name = gr.Textbox(label="Output Filename", value="audiobook.mp3")
-                        run_root = gr.Textbox(label="Run Root Folder", value=str(DEFAULT_RUN_ROOT.resolve()))
-
-                        max_chars_per_batch = gr.Slider(
-                            label="Max chars per batch",
-                            minimum=100,
-                            maximum=5000,
-                            step=50,
-                            value=DEFAULT_MAX_CHARS,
-                        )
-                        pause_ms = gr.Slider(
-                            label="Pause between batches (ms)",
-                            minimum=0,
-                            maximum=5000,
-                            step=25,
-                            value=DEFAULT_PAUSE_MS,
-                        )
-                        chapter_pause_ms = gr.Slider(
-                            label="Additional chapter pause (ms)",
-                            minimum=0,
-                            maximum=8000,
-                            step=25,
-                            value=DEFAULT_CHAPTER_PAUSE_MS,
-                        )
-                        mp3_quality = gr.Slider(
-                            label="MP3 quality (0 best, 9 smallest)",
-                            minimum=0,
-                            maximum=9,
-                            step=1,
-                            value=0,
-                        )
-                        use_chapters = gr.Checkbox(label="Embed chapter metadata", value=True)
-                        language = gr.Dropdown(
-                            label="Language",
-                            choices=["Auto", "English", "Chinese", "Japanese", "Korean"],
-                            value="Auto",
-                            allow_custom_value=True,
-                        )
-
-                        with gr.Accordion("Advanced", open=False):
-                            tts_backend = gr.Dropdown(
-                                label="TTS backend",
-                                choices=["moss-delay", "moss-local", "moss-ttsd", "qwen", "auto"],
-                                value=DEFAULT_TTS_BACKEND,
-                            )
-                            model_id = gr.Textbox(label="Model ID", value=DEFAULT_MODEL_ID)
-                            device = gr.Textbox(label="Device", value="cuda:0")
-                            dtype = gr.Dropdown(
-                                label="DType",
-                                choices=["float16", "bfloat16", "float32"],
-                                value=DEFAULT_DTYPE,
-                            )
-                            attn_implementation = gr.Dropdown(
-                                label="Attention implementation",
-                                choices=["sdpa", "flash_attention_2"],
-                                value=DEFAULT_ATTN_IMPLEMENTATION,
-                            )
-                            inference_batch_size = gr.Slider(
-                                label="Inference batch size (0 = auto)",
-                                minimum=0,
-                                maximum=16,
-                                step=1,
-                                value=0,
-                            )
-                            max_new_tokens = gr.Slider(
-                                label="Max new tokens (MOSS)",
-                                minimum=256,
-                                maximum=16384,
-                                step=128,
-                                value=DEFAULT_MAX_NEW_TOKENS,
-                            )
-                            continuation_chain = gr.Checkbox(
-                                label="Continuation chain (best continuity, slower)",
-                                value=False,
-                            )
-                            continuation_anchor_seconds = gr.Slider(
-                                label="Continuation anchor seconds",
-                                minimum=2.0,
-                                maximum=30.0,
-                                step=0.5,
-                                value=DEFAULT_CONTINUATION_ANCHOR_SECONDS,
-                            )
-                            stop_after_batch = gr.Number(
-                                label="Stop after batch (testing)",
-                                value=0,
-                                precision=0,
-                            )
-
-                with gr.Row():
-                    run_button = gr.Button("Generate Audiobook", variant="primary", size="lg")
-                    clear_button = gr.Button("Clear Output", variant="secondary")
-
-            with gr.Tab("2. Multi-Speaker Generation"):
-                gr.Markdown(
-                    "Multi-speaker generation workspace. This page is organized and ready for speaker mapping/script tooling, "
-                    "but the backend generation flow is not wired yet."
-                )
-                gr.Markdown("### Multi-Speaker Script Draft")
-                gr.Textbox(
-                    label="Dialogue / Narration Script",
-                    lines=14,
-                    placeholder=(
-                        "Example:\n"
-                        "[NARRATOR] The room fell silent.\n"
-                        "[SPEAKER_A] Are you sure this will work?\n"
-                        "[SPEAKER_B] It has to."
-                    ),
-                )
-                with gr.Row():
-                    gr.Textbox(
-                        label="Speaker Map (notes)",
-                        lines=8,
-                        placeholder="SPEAKER_A -> warm_narrator_v1\nSPEAKER_B -> calm_female_v2",
-                    )
-                    gr.Markdown(
-                        "### Planned Controls\n\n"
-                        "- Speaker-to-voice assignment\n"
-                        "- Per-speaker style overrides\n"
-                        "- Scene/chapter export\n"
-                        "- Batch render queue"
-                    )
-
-            with gr.Tab("3. Voice Lab"):
-                gr.Markdown(
-                    "Voice Lab includes voice generation plus a `/voices` browser so you can preview existing voices, "
-                    "import new files, and apply a selected voice to the main generation page."
-                )
-                with gr.Row(elem_classes=["app-shell"]):
-                    with gr.Column(scale=1):
-                        gr.Markdown("### Voice Library Browser")
-                        with gr.Row():
-                            voice_library_dropdown = gr.Dropdown(
-                                label="Voice Library (/voices)",
-                                choices=voice_library_choices,
-                                value=initial_voice_library_value,
-                                allow_custom_value=False,
-                                scale=5,
-                            )
-                            voice_library_refresh_button = gr.Button("Refresh", scale=1, variant="secondary")
-                        with gr.Row():
-                            voice_library_apply_button = gr.Button(
-                                "Use Selected Voice In Main",
-                                variant="secondary",
-                                scale=2,
-                            )
-                            voice_library_preview_button = gr.Button(
-                                "Preview Selected",
-                                variant="secondary",
-                                scale=1,
-                            )
-                        voice_library_status = gr.Markdown(
-                            f"Using `{_ensure_voices_dir()}` for voice files."
-                        )
-                        voice_library_inspector_status = gr.Markdown(initial_voice_library_inspector_status)
-                        voice_library_inventory = gr.Markdown(value=_voice_library_inventory_markdown())
-                        voice_library_preview_audio = gr.Audio(
-                            label="Selected Voice Preview",
-                            value=initial_voice_library_preview_audio,
-                            type="filepath",
-                            interactive=False,
-                        )
-                        voice_library_selected_file = gr.File(
-                            label="Selected Voice File",
-                            value=initial_voice_library_selected_file,
-                            interactive=False,
-                        )
-                        voice_library_preview_text = gr.Textbox(
-                            label="Transcript / Preview Text",
-                            lines=5,
-                            value=initial_voice_library_preview_text,
-                            interactive=False,
-                        )
-                        voice_library_metadata_text = gr.Textbox(
-                            label="Voice Metadata (.voice.json)",
-                            lines=10,
-                            value=initial_voice_library_metadata_text,
-                            interactive=False,
-                            elem_classes=["mono-log"],
-                        )
-                        with gr.Accordion("Upload / Import Files To /voices", open=False):
-                            voice_library_upload_files = gr.File(
-                                label="Voice Files To Import",
-                                file_types=audio_types + [".txt", ".json"],
-                                file_count="multiple",
-                                type="filepath",
-                            )
-                            voice_library_upload_overwrite = gr.Checkbox(
-                                label="Overwrite existing filenames",
-                                value=False,
-                            )
-                            voice_library_upload_button = gr.Button(
-                                "Import Files To /voices",
-                                variant="primary",
-                            )
-                            voice_library_upload_status = gr.Markdown("### Voice Import\n\nReady")
-
-                    with gr.Column(scale=1):
-                        gr.Markdown(
-                            "### Voice Generator\n\n"
-                            "Preview and save a synthetic voice generated from a text description using MOSS VoiceGenerator. "
-                            "Saved voices go to `/voices` as `.wav + .txt + .voice.json`."
-                        )
-                        voice_lab_status = gr.Markdown("### Voice Lab Ready")
-                        with gr.Row():
-                            voice_lab_name = gr.Textbox(
-                                label="Voice Name",
-                                placeholder="e.g. warm_narrator_v1",
-                                value="voice_lab_preview",
-                            )
-                            voice_lab_overwrite = gr.Checkbox(
-                                label="Overwrite existing files",
-                                value=True,
-                            )
-                        voice_lab_description = gr.Textbox(
-                            label="Voice Description",
-                            lines=4,
-                            placeholder=(
-                                "Describe the voice style (tone, age, accent, pacing, texture, emotion). "
-                                "Example: Calm middle-aged male narrator, warm tone, measured pacing, slight breathiness."
-                            ),
-                        )
-                        voice_lab_preview_text = gr.Textbox(
-                            label="Preview Text",
-                            lines=4,
-                            value=(
-                                "This is a voice preview generated from a text description. "
-                                "If the tone sounds right, save it and reuse it from the voices folder."
-                            ),
-                        )
-                        with gr.Accordion("Voice Lab Advanced", open=False):
-                            voice_lab_model_id = gr.Textbox(
-                                label="VoiceGenerator Model ID",
-                                value=DEFAULT_VOICEGEN_MODEL_ID,
-                            )
-                            with gr.Row():
-                                voice_lab_device = gr.Textbox(label="Device", value="cuda:0")
-                                voice_lab_dtype = gr.Dropdown(
-                                    label="DType",
-                                    choices=["float16", "bfloat16", "float32"],
-                                    value=DEFAULT_DTYPE,
-                                )
-                                voice_lab_attn = gr.Dropdown(
-                                    label="Attention",
-                                    choices=["sdpa", "flash_attention_2", "eager"],
-                                    value=DEFAULT_ATTN_IMPLEMENTATION,
-                                )
-                            voice_lab_max_new_tokens = gr.Slider(
-                                label="Max new tokens",
-                                minimum=256,
-                                maximum=8192,
-                                step=64,
-                                value=2048,
-                            )
-                        with gr.Row():
-                            voice_lab_generate_button = gr.Button(
-                                "Generate Preview + Save Voice",
-                                variant="primary",
-                            )
-                            voice_lab_refresh_button = gr.Button(
-                                "Refresh /voices",
-                                variant="secondary",
-                            )
-                        voice_lab_preview_audio = gr.Audio(
-                            label="Voice Preview Audio",
-                            type="filepath",
-                            interactive=False,
-                        )
-                        voice_lab_saved_file = gr.File(
-                            label="Saved Voice Preset (.voice.json)",
-                            interactive=False,
-                        )
-                        voice_lab_log = gr.Textbox(
-                            label="Voice Lab Log",
-                            lines=10,
-                            elem_classes=["mono-log"],
-                        )
-
-            with gr.Tab("4. Pre / Post-Processing Tools"):
-                gr.Markdown(
-                    "Workspace for pre-processing inputs and post-processing outputs. "
-                    "This tab is intentionally separated so utilities do not crowd the main generation page."
-                )
-                with gr.Accordion("Pre-Processing (Reference Audio / Text)", open=True):
-                    gr.Markdown(
-                        "- Reference audio trimming / cleanup (planned UI wrapper)\n"
-                        "- Transcript normalization and punctuation cleanup (planned)\n"
-                        "- Batch file staging and naming helpers (planned)"
-                    )
-                    gr.Textbox(
-                        label="Tool Notes / Scratchpad",
-                        lines=8,
-                        placeholder="Use this area to collect ffmpeg commands, preprocessing notes, or pipeline steps.",
-                    )
-                with gr.Accordion("Post-Processing (Output Audio)", open=False):
-                    gr.Markdown(
-                        "- Loudness normalization\n"
-                        "- Silence trim / fade helpers\n"
-                        "- Split/merge chapters\n"
-                        "- Alternate encode/export presets"
-                    )
-                    gr.Textbox(
-                        label="Post-Processing Queue Ideas",
-                        lines=8,
-                        placeholder="List post-processing steps you want to automate next.",
-                    )
-
-            with gr.Tab("5. Text Editing + Chapter Generation"):
-                gr.Markdown(
-                    "Book text workspace plus chapter tooling. Edit text here, then generate chapter markers and push the result "
-                    "back into the main book text used for generation."
+                    "Start here: add or edit book text, preview chunking, and insert chapter markers before rendering."
                 )
                 with gr.Row(elem_classes=["app-shell"]):
                     with gr.Column(scale=2):
                         text_input = gr.Textbox(
                             label="Book Text (optional)",
                             placeholder="Paste text here, or upload a .txt file below.",
-                            lines=12,
+                            lines=14,
                         )
                         text_file = gr.File(
                             label="Book Text File (.txt)",
@@ -2485,11 +2278,15 @@ def build_demo() -> gr.Blocks:
                     with gr.Column(scale=1):
                         gr.Markdown(
                             "### Workflow\n\n"
-                            "1. Paste/upload text here.\n"
-                            "2. Load into Chapter Assist working text.\n"
-                            "3. Preview regex matches and chunking.\n"
+                            "1. Paste/upload text.\n"
+                            "2. Load into Chapter Assist.\n"
+                            "3. Build/preview regex.\n"
                             "4. Insert `[CHAPTER]` markers.\n"
-                            "5. Apply back to the Book Text field."
+                            "5. Apply back to Book Text."
+                        )
+                        step1_next_to_step2_button = gr.Button(
+                            "Next Step: Voice Lab (Step 2)",
+                            variant="primary",
                         )
 
                 gr.Markdown(
@@ -2537,6 +2334,379 @@ def build_demo() -> gr.Blocks:
                     chapter_insert_button = gr.Button("Insert [CHAPTER] Markers", variant="primary")
                 chapter_match_preview = gr.Markdown("### Regex Matches\n\nNo preview yet.")
                 chapter_chunk_preview = gr.Markdown("### Chunk Preview\n\nNo preview yet.")
+                with gr.Row():
+                    step1_next_to_step2_button_bottom = gr.Button(
+                        "Continue to Step 2: Voice Lab",
+                        variant="primary",
+                    )
+                    step1_open_monitor_button = gr.Button(
+                        "Open Monitor",
+                        variant="secondary",
+                    )
+
+            with gr.Tab("Step 2. Voice Lab (Browse / Create / Upload)", id="step2_voice"):
+                gr.Markdown(
+                    "Pick a voice for generation, preview existing voices, upload new voice assets into `/voices`, or create a synthetic voice preset."
+                )
+                with gr.Row():
+                    step2_back_to_step1_button = gr.Button("Back to Step 1: Text", variant="secondary")
+                    step2_next_to_step3_button = gr.Button("Next Step: Main Generation (Step 3)", variant="primary")
+                with gr.Row(elem_classes=["app-shell"]):
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Voice Library Browser")
+                        with gr.Row():
+                            voice_library_dropdown = gr.Dropdown(
+                                label="Voice Library (/voices)",
+                                choices=voice_library_choices,
+                                value=initial_voice_library_value,
+                                allow_custom_value=False,
+                                scale=5,
+                            )
+                            voice_library_refresh_button = gr.Button("Refresh", scale=1, variant="secondary")
+                        with gr.Row():
+                            voice_library_apply_button = gr.Button(
+                                "Use Selected Voice In Step 3",
+                                variant="secondary",
+                                scale=2,
+                            )
+                            voice_library_preview_button = gr.Button(
+                                "Preview Selected",
+                                variant="secondary",
+                                scale=1,
+                            )
+                        voice_library_status = gr.Markdown(f"Using `{_ensure_voices_dir()}` for voice files.")
+                        voice_library_inspector_status = gr.Markdown(initial_voice_library_inspector_status)
+                        voice_library_inventory = gr.Markdown(value=_voice_library_inventory_markdown())
+                        voice_library_preview_audio = gr.Audio(
+                            label="Selected Voice Preview",
+                            value=initial_voice_library_preview_audio,
+                            type="filepath",
+                            interactive=False,
+                        )
+                        voice_library_selected_file = gr.File(
+                            label="Selected Voice File",
+                            value=initial_voice_library_selected_file,
+                            interactive=False,
+                        )
+                        voice_library_preview_text = gr.Textbox(
+                            label="Transcript / Preview Text",
+                            value=initial_voice_library_preview_text,
+                            lines=5,
+                            interactive=False,
+                        )
+                        voice_library_metadata_text = gr.Textbox(
+                            label="Voice Metadata (.voice.json)",
+                            value=initial_voice_library_metadata_text,
+                            lines=10,
+                            interactive=False,
+                            elem_classes=["mono-log"],
+                        )
+                        with gr.Accordion("Upload / Import Files To /voices", open=False):
+                            voice_library_upload_files = gr.File(
+                                label="Voice Files To Import",
+                                file_types=audio_types + [".txt", ".json"],
+                                file_count="multiple",
+                                type="filepath",
+                            )
+                            voice_library_upload_overwrite = gr.Checkbox(
+                                label="Overwrite existing filenames",
+                                value=False,
+                            )
+                            voice_library_upload_button = gr.Button("Import Files To /voices", variant="primary")
+                            voice_library_upload_status = gr.Markdown("### Voice Import\n\nReady")
+
+                    with gr.Column(scale=1):
+                        gr.Markdown(
+                            "### Voice Generator\n\n"
+                            "Generate a voice preview from a text description and save it as `.wav + .txt + .voice.json` in `/voices`."
+                        )
+                        voice_lab_status = gr.Markdown("### Voice Lab Ready")
+                        with gr.Row():
+                            voice_lab_name = gr.Textbox(
+                                label="Voice Name",
+                                placeholder="e.g. warm_narrator_v1",
+                                value="voice_lab_preview",
+                            )
+                            voice_lab_overwrite = gr.Checkbox(label="Overwrite existing files", value=True)
+                        voice_lab_description = gr.Textbox(
+                            label="Voice Description",
+                            lines=4,
+                            placeholder=(
+                                "Describe tone, age, accent, pacing, texture, emotion. "
+                                "Example: Calm middle-aged male narrator, warm tone, measured pacing, slight breathiness."
+                            ),
+                        )
+                        voice_lab_preview_text = gr.Textbox(
+                            label="Preview Text",
+                            lines=4,
+                            value=(
+                                "This is a voice preview generated from a text description. "
+                                "If the tone sounds right, save it and reuse it from the voices folder."
+                            ),
+                        )
+                        with gr.Accordion("Voice Lab Advanced", open=False):
+                            voice_lab_model_id = gr.Textbox(
+                                label="VoiceGenerator Model ID",
+                                value=DEFAULT_VOICEGEN_MODEL_ID,
+                            )
+                            with gr.Row():
+                                voice_lab_device = gr.Textbox(label="Device", value="cuda:0")
+                                voice_lab_dtype = gr.Dropdown(
+                                    label="DType",
+                                    choices=["float16", "bfloat16", "float32"],
+                                    value=DEFAULT_DTYPE,
+                                )
+                                voice_lab_attn = gr.Dropdown(
+                                    label="Attention",
+                                    choices=["sdpa", "flash_attention_2", "eager"],
+                                    value=DEFAULT_ATTN_IMPLEMENTATION,
+                                )
+                            voice_lab_max_new_tokens = gr.Slider(
+                                label="Max new tokens",
+                                minimum=256,
+                                maximum=8192,
+                                step=64,
+                                value=2048,
+                            )
+                        with gr.Row():
+                            voice_lab_generate_button = gr.Button("Generate Preview + Save Voice", variant="primary")
+                            voice_lab_refresh_button = gr.Button("Refresh /voices", variant="secondary")
+                        voice_lab_preview_audio = gr.Audio(label="Voice Preview Audio", type="filepath", interactive=False)
+                        voice_lab_saved_file = gr.File(label="Saved Voice Preset (.voice.json)", interactive=False)
+                        voice_lab_log = gr.Textbox(label="Voice Lab Log", lines=10, elem_classes=["mono-log"])
+                with gr.Row():
+                    step2_next_to_step3_button_bottom = gr.Button(
+                        "Continue to Step 3: Main Generation",
+                        variant="primary",
+                    )
+                    step2_open_monitor_button = gr.Button("Open Monitor", variant="secondary")
+
+            with gr.Tab("Step 3. Main Book Generation", id="step3_generate"):
+                gr.Markdown(
+                    "Run the audiobook render. Use Step 1 for text and Step 2 to prepare/select a voice before starting."
+                )
+                step3_gate_status = gr.Markdown(initial_step3_gate_status_md)
+                with gr.Column(
+                    visible=bool(initial_step3_locked_panel_update.get("visible", True))
+                ) as step3_locked_panel:
+                    gr.Markdown(
+                        "Generation controls are hidden until Step 1 has book text. Paste/edit text or upload a `.txt` file, then return here."
+                    )
+                    with gr.Row():
+                        step3_go_step1_button = gr.Button("Go to Step 1: Text", variant="primary")
+                        step3_check_unlock_button = gr.Button("Check for Text Again", variant="secondary")
+                with gr.Column(
+                    visible=bool(initial_step3_controls_panel_update.get("visible", False))
+                ) as step3_controls_panel:
+                    with gr.Row():
+                        step3_back_to_step2_button = gr.Button("Back to Step 2: Voice Lab", variant="secondary")
+                        step3_next_monitor_button = gr.Button("Next: Monitor", variant="secondary")
+                    with gr.Row(elem_classes=["app-shell"]):
+                        with gr.Column(scale=2):
+                            gr.Markdown("### Reference Voice + Resume")
+                            reference_audio_file = gr.File(
+                                label="Reference Audio File",
+                                file_types=audio_types,
+                                type="filepath",
+                            )
+                            reference_audio_path = gr.Textbox(
+                                label="Reference Audio Path or URL (optional)",
+                                placeholder="Use this if you do not upload audio.",
+                            )
+                            reference_text = gr.Textbox(
+                                label="Reference Transcript (optional)",
+                                placeholder="Required unless X-Vector only mode is enabled.",
+                                lines=4,
+                            )
+                            reference_text_file = gr.File(
+                                label="Reference Transcript File (.txt)",
+                                file_types=[".txt"],
+                                type="filepath",
+                            )
+                            x_vector_only_mode = gr.Checkbox(
+                                label="X-Vector Only Mode (no transcript required)",
+                                value=False,
+                            )
+                            resume_state_file = gr.File(
+                                label="Resume State (session_state.json, optional)",
+                                file_types=[".json"],
+                                type="filepath",
+                            )
+                        with gr.Column(scale=1):
+                            gr.Markdown("### Output + Runtime")
+                            output_name = gr.Textbox(label="Output Filename", value="audiobook.mp3")
+                            run_root = gr.Textbox(label="Run Root Folder", value=str(DEFAULT_RUN_ROOT.resolve()))
+                            max_chars_per_batch = gr.Slider(
+                                label="Max chars per batch",
+                                minimum=100,
+                                maximum=5000,
+                                step=50,
+                                value=DEFAULT_MAX_CHARS,
+                            )
+                            pause_ms = gr.Slider(
+                                label="Pause between batches (ms)",
+                                minimum=0,
+                                maximum=5000,
+                                step=25,
+                                value=DEFAULT_PAUSE_MS,
+                            )
+                            chapter_pause_ms = gr.Slider(
+                                label="Additional chapter pause (ms)",
+                                minimum=0,
+                                maximum=8000,
+                                step=25,
+                                value=DEFAULT_CHAPTER_PAUSE_MS,
+                            )
+                            mp3_quality = gr.Slider(
+                                label="MP3 quality (0 best, 9 smallest)",
+                                minimum=0,
+                                maximum=9,
+                                step=1,
+                                value=0,
+                            )
+                            use_chapters = gr.Checkbox(label="Embed chapter metadata", value=True)
+                            language = gr.Dropdown(
+                                label="Language",
+                                choices=["Auto", "English", "Chinese", "Japanese", "Korean"],
+                                value="Auto",
+                                allow_custom_value=True,
+                            )
+                            with gr.Accordion("Advanced", open=False):
+                                tts_backend = gr.Dropdown(
+                                    label="TTS backend",
+                                    choices=["moss-delay", "moss-local", "moss-ttsd", "qwen", "auto"],
+                                    value=DEFAULT_TTS_BACKEND,
+                                )
+                                model_id = gr.Textbox(label="Model ID", value=DEFAULT_MODEL_ID)
+                                device = gr.Textbox(label="Device", value="cuda:0")
+                                dtype = gr.Dropdown(
+                                    label="DType",
+                                    choices=["float16", "bfloat16", "float32"],
+                                    value=DEFAULT_DTYPE,
+                                )
+                                attn_implementation = gr.Dropdown(
+                                    label="Attention implementation",
+                                    choices=["sdpa", "flash_attention_2"],
+                                    value=DEFAULT_ATTN_IMPLEMENTATION,
+                                )
+                                inference_batch_size = gr.Slider(
+                                    label="Inference batch size (0 = auto)",
+                                    minimum=0,
+                                    maximum=16,
+                                    step=1,
+                                    value=0,
+                                )
+                                max_new_tokens = gr.Slider(
+                                    label="Max new tokens (MOSS)",
+                                    minimum=256,
+                                    maximum=16384,
+                                    step=128,
+                                    value=DEFAULT_MAX_NEW_TOKENS,
+                                )
+                                continuation_chain = gr.Checkbox(
+                                    label="Continuation chain (best continuity, slower)",
+                                    value=False,
+                                )
+                                continuation_anchor_seconds = gr.Slider(
+                                    label="Continuation anchor seconds",
+                                    minimum=2.0,
+                                    maximum=30.0,
+                                    step=0.5,
+                                    value=DEFAULT_CONTINUATION_ANCHOR_SECONDS,
+                                )
+                                stop_after_batch = gr.Number(
+                                    label="Stop after batch (testing)",
+                                    value=0,
+                                    precision=0,
+                                )
+                    with gr.Row():
+                        run_button = gr.Button("Generate Audiobook", variant="primary", size="lg")
+                        clear_button = gr.Button("Clear Output", variant="secondary")
+                    gr.Markdown("Detailed run telemetry and logs are available in the **Monitor** tab.")
+
+            with gr.Tab("Step 4. Multi-Speaker Generation", id="step4_multi"):
+                gr.Markdown(
+                    "Workspace for future multi-speaker rendering. Keep script/dialogue prep here while the backend flow is added."
+                )
+                gr.Textbox(
+                    label="Dialogue / Narration Script",
+                    lines=14,
+                    placeholder=(
+                        "Example:\n"
+                        "[NARRATOR] The room fell silent.\n"
+                        "[SPEAKER_A] Are you sure this will work?\n"
+                        "[SPEAKER_B] It has to."
+                    ),
+                )
+                with gr.Row():
+                    gr.Textbox(
+                        label="Speaker Map (notes)",
+                        lines=8,
+                        placeholder="SPEAKER_A -> warm_narrator_v1\nSPEAKER_B -> calm_female_v2",
+                    )
+                    gr.Markdown(
+                        "### Planned Controls\n\n"
+                        "- Speaker-to-voice assignment\n"
+                        "- Per-speaker style overrides\n"
+                        "- Scene/chapter export\n"
+                        "- Batch render queue"
+                    )
+
+            with gr.Tab("Step 5. Pre / Post-Processing Tools", id="step5_tools"):
+                gr.Markdown(
+                    "Pre/post-processing workspace for reference prep and output finishing tools."
+                )
+                with gr.Accordion("Pre-Processing (Reference Audio / Text)", open=True):
+                    gr.Markdown(
+                        "- Reference audio trimming / cleanup (planned UI wrapper)\n"
+                        "- Transcript normalization and punctuation cleanup (planned)\n"
+                        "- Batch file staging and naming helpers (planned)"
+                    )
+                    gr.Textbox(
+                        label="Tool Notes / Scratchpad",
+                        lines=8,
+                        placeholder="Use this area to collect ffmpeg commands, preprocessing notes, or pipeline steps.",
+                    )
+                with gr.Accordion("Post-Processing (Output Audio)", open=False):
+                    gr.Markdown(
+                        "- Loudness normalization\n"
+                        "- Silence trim / fade helpers\n"
+                        "- Split/merge chapters\n"
+                        "- Alternate encode/export presets"
+                    )
+                    gr.Textbox(
+                        label="Post-Processing Queue Ideas",
+                        lines=8,
+                        placeholder="List post-processing steps you want to automate next.",
+                    )
+
+            with gr.Tab("Monitor (Telemetry + Logs)", id="monitor"):
+                gr.Markdown(
+                    "Detailed run status, telemetry, outputs, and logs. The sticky progress bar at the top stays minimal while you work in other tabs."
+                )
+                status = gr.Markdown("### Ready")
+                with gr.Row(elem_classes=["app-shell"]):
+                    with gr.Column(scale=3):
+                        telemetry = gr.HTML(
+                            value=_render_telemetry_panel(
+                                log_lines=[],
+                                command=None,
+                                job_root=None,
+                                run_root=DEFAULT_RUN_ROOT.resolve(),
+                                expected_output=None,
+                                device_hint="cuda:0",
+                                started_at=None,
+                                process_pid=None,
+                                cache={},
+                            )
+                        )
+                    with gr.Column(scale=2):
+                        logs = gr.Textbox(label="Run Log", lines=18, elem_classes=["mono-log"])
+                with gr.Row(elem_classes=["app-shell"]):
+                    with gr.Column(scale=2):
+                        audio_output = gr.Audio(label="Output Preview", type="filepath", interactive=False)
+                    with gr.Column(scale=1):
+                        file_output = gr.File(label="Download Output", interactive=False)
 
         run_button.click(
             fn=run_generation,
@@ -2568,7 +2738,7 @@ def build_demo() -> gr.Blocks:
                 continuation_anchor_seconds,
                 stop_after_batch,
             ],
-            outputs=[status, audio_output, file_output, logs, telemetry],
+            outputs=[status, audio_output, file_output, logs, telemetry, progress_strip],
         )
 
         clear_button.click(
@@ -2588,8 +2758,70 @@ def build_demo() -> gr.Blocks:
                     process_pid=None,
                     cache={},
                 ),
+                _render_compact_progress_strip(
+                    log_lines=[],
+                    started_at=None,
+                    expected_output=None,
+                ),
             ),
-            outputs=[status, audio_output, file_output, logs, telemetry],
+            outputs=[status, audio_output, file_output, logs, telemetry, progress_strip],
+        )
+
+        step1_next_to_step2_button.click(
+            fn=lambda: _select_workflow_tab("step2_voice"),
+            outputs=[workflow_tabs],
+        )
+        step1_next_to_step2_button_bottom.click(
+            fn=lambda: _select_workflow_tab("step2_voice"),
+            outputs=[workflow_tabs],
+        )
+        step1_open_monitor_button.click(
+            fn=lambda: _select_workflow_tab("monitor"),
+            outputs=[workflow_tabs],
+        )
+        step2_back_to_step1_button.click(
+            fn=lambda: _select_workflow_tab("step1_text"),
+            outputs=[workflow_tabs],
+        )
+        step2_next_to_step3_button.click(
+            fn=lambda: _select_workflow_tab("step3_generate"),
+            outputs=[workflow_tabs],
+        )
+        step2_next_to_step3_button_bottom.click(
+            fn=lambda: _select_workflow_tab("step3_generate"),
+            outputs=[workflow_tabs],
+        )
+        step2_open_monitor_button.click(
+            fn=lambda: _select_workflow_tab("monitor"),
+            outputs=[workflow_tabs],
+        )
+        step3_go_step1_button.click(
+            fn=lambda: _select_workflow_tab("step1_text"),
+            outputs=[workflow_tabs],
+        )
+        step3_back_to_step2_button.click(
+            fn=lambda: _select_workflow_tab("step2_voice"),
+            outputs=[workflow_tabs],
+        )
+        step3_next_monitor_button.click(
+            fn=lambda: _select_workflow_tab("monitor"),
+            outputs=[workflow_tabs],
+        )
+
+        text_input.change(
+            fn=_step3_gate_visibility_updates,
+            inputs=[text_input, text_file],
+            outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
+        )
+        text_file.change(
+            fn=_step3_gate_visibility_updates,
+            inputs=[text_input, text_file],
+            outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
+        )
+        step3_check_unlock_button.click(
+            fn=_step3_gate_visibility_updates,
+            inputs=[text_input, text_file],
+            outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
         )
 
         voice_library_refresh_button.click(
@@ -2725,10 +2957,15 @@ def build_demo() -> gr.Blocks:
             inputs=[text_input],
             outputs=[chapter_assist_text],
         )
-        chapter_assist_apply_main_button.click(
+        chapter_assist_apply_main_event = chapter_assist_apply_main_button.click(
             fn=_copy_text_or_blank,
             inputs=[chapter_assist_text],
             outputs=[text_input],
+        )
+        chapter_assist_apply_main_event.then(
+            fn=_step3_gate_visibility_updates,
+            inputs=[text_input, text_file],
+            outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
         )
         chapter_build_pattern_button.click(
             fn=lambda preset, custom_word, custom_regex: (
