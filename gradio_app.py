@@ -1344,6 +1344,192 @@ def _copy_text_or_blank(value: str) -> str:
     return str(value or "")
 
 
+def _dialogue_mode_enabled(workflow_mode: str, tts_backend: str) -> bool:
+    mode = str(workflow_mode or "").strip().lower()
+    backend = str(tts_backend or "").strip().lower()
+    return mode == "dialogue" or backend == "moss-ttsd"
+
+
+def update_workflow_visibility(
+    workflow_mode: str,
+    tts_backend: str,
+    speaker_tags_enabled: bool,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    dialogue = _dialogue_mode_enabled(workflow_mode, tts_backend)
+    speaker_tags_value = True if dialogue else False
+    if dialogue:
+        detail = (
+            "Dialogue mode is active. Speaker 2 inputs are visible and `speaker tags` are enabled "
+            "for MOSS-TTSD / `[S1]` `[S2]` text."
+        )
+    else:
+        detail = (
+            "Single-speaker mode is active. Extra speaker controls are hidden to reduce clutter."
+        )
+    return (
+        gr.update(visible=dialogue),
+        gr.update(value=speaker_tags_value),
+        _build_status_message("Workflow Mode", detail),
+    )
+
+
+def update_reference_transcript_visibility(
+    x_vector_only_mode: bool,
+) -> tuple[dict[str, Any], str]:
+    visible = not bool(x_vector_only_mode)
+    detail = (
+        "Reference transcript fields are hidden because X-Vector only mode is enabled."
+        if not visible
+        else "Reference transcript fields are visible."
+    )
+    return gr.update(visible=visible), _build_status_message("Reference Inputs", detail)
+
+
+def apply_run_preset(
+    preset_name: str,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    str,
+]:
+    preset = str(preset_name or "").strip().lower()
+    updates: dict[str, Any] = {
+        "workflow_mode": gr.update(),
+        "tts_backend": gr.update(),
+        "model_id": gr.update(),
+        "inference_batch_size": gr.update(),
+        "max_chars_per_batch": gr.update(),
+        "pause_ms": gr.update(),
+        "chapter_pause_ms": gr.update(),
+        "use_chapters": gr.update(),
+        "continuation_chain": gr.update(),
+        "continuation_anchor_seconds": gr.update(),
+        "max_new_tokens": gr.update(),
+        "attn_implementation": gr.update(),
+        "dtype": gr.update(),
+        "x_vector_only_mode": gr.update(),
+        "speaker_tags": gr.update(),
+    }
+    detail = "Preset not recognized."
+
+    if preset in {"moss long-form (default)", "moss long-form", "default"}:
+        updates.update(
+            {
+                "workflow_mode": gr.update(value="single"),
+                "tts_backend": gr.update(value="moss-delay"),
+                "model_id": gr.update(value="OpenMOSS-Team/MOSS-TTS"),
+                "inference_batch_size": gr.update(value=0),
+                "max_chars_per_batch": gr.update(value=1800),
+                "pause_ms": gr.update(value=50),
+                "chapter_pause_ms": gr.update(value=500),
+                "use_chapters": gr.update(value=True),
+                "continuation_chain": gr.update(value=False),
+                "continuation_anchor_seconds": gr.update(value=DEFAULT_CONTINUATION_ANCHOR_SECONDS),
+                "max_new_tokens": gr.update(value=max(1024, int(DEFAULT_MAX_NEW_TOKENS))),
+                "attn_implementation": gr.update(value=DEFAULT_ATTN_IMPLEMENTATION),
+                "dtype": gr.update(value=DEFAULT_DTYPE),
+                "x_vector_only_mode": gr.update(value=False),
+                "speaker_tags": gr.update(value=False),
+            }
+        )
+        detail = "Applied MOSS long-form preset (balanced speed + quality)."
+    elif preset in {"moss stable (gpu-safe)", "moss stable", "gpu-safe"}:
+        updates.update(
+            {
+                "workflow_mode": gr.update(value="single"),
+                "tts_backend": gr.update(value="moss-delay"),
+                "model_id": gr.update(value="OpenMOSS-Team/MOSS-TTS"),
+                "inference_batch_size": gr.update(value=1),
+                "max_chars_per_batch": gr.update(value=1200),
+                "pause_ms": gr.update(value=50),
+                "chapter_pause_ms": gr.update(value=500),
+                "use_chapters": gr.update(value=True),
+                "continuation_chain": gr.update(value=False),
+                "continuation_anchor_seconds": gr.update(value=DEFAULT_CONTINUATION_ANCHOR_SECONDS),
+                "max_new_tokens": gr.update(value=1024),
+                "attn_implementation": gr.update(value="sdpa"),
+                "dtype": gr.update(value="float16"),
+                "x_vector_only_mode": gr.update(value=False),
+                "speaker_tags": gr.update(value=False),
+            }
+        )
+        detail = "Applied MOSS stable preset (safer CUDA settings)."
+    elif preset in {"moss dialogue (ttsd)", "ttsd dialogue", "dialogue"}:
+        updates.update(
+            {
+                "workflow_mode": gr.update(value="dialogue"),
+                "tts_backend": gr.update(value="moss-ttsd"),
+                "model_id": gr.update(value="OpenMOSS-Team/MOSS-TTSD-v1.0"),
+                "inference_batch_size": gr.update(value=1),
+                "max_chars_per_batch": gr.update(value=1600),
+                "pause_ms": gr.update(value=50),
+                "chapter_pause_ms": gr.update(value=500),
+                "use_chapters": gr.update(value=True),
+                "continuation_chain": gr.update(value=False),
+                "continuation_anchor_seconds": gr.update(value=DEFAULT_CONTINUATION_ANCHOR_SECONDS),
+                "max_new_tokens": gr.update(value=2048),
+                "attn_implementation": gr.update(value=DEFAULT_ATTN_IMPLEMENTATION),
+                "dtype": gr.update(value=DEFAULT_DTYPE),
+                "x_vector_only_mode": gr.update(value=False),
+                "speaker_tags": gr.update(value=True),
+            }
+        )
+        detail = "Applied MOSS-TTSD dialogue preset (2-speaker mode)."
+    elif preset in {"qwen clone", "qwen"}:
+        updates.update(
+            {
+                "workflow_mode": gr.update(value="single"),
+                "tts_backend": gr.update(value="qwen"),
+                "model_id": gr.update(value="Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+                "inference_batch_size": gr.update(value=1),
+                "max_chars_per_batch": gr.update(value=1200),
+                "pause_ms": gr.update(value=50),
+                "chapter_pause_ms": gr.update(value=500),
+                "use_chapters": gr.update(value=True),
+                "continuation_chain": gr.update(value=False),
+                "continuation_anchor_seconds": gr.update(value=DEFAULT_CONTINUATION_ANCHOR_SECONDS),
+                "max_new_tokens": gr.update(value=1024),
+                "attn_implementation": gr.update(value="sdpa"),
+                "dtype": gr.update(value=DEFAULT_DTYPE),
+                "x_vector_only_mode": gr.update(value=False),
+                "speaker_tags": gr.update(value=False),
+            }
+        )
+        detail = "Applied Qwen clone preset."
+
+    return (
+        updates["workflow_mode"],
+        updates["tts_backend"],
+        updates["model_id"],
+        updates["inference_batch_size"],
+        updates["max_chars_per_batch"],
+        updates["pause_ms"],
+        updates["chapter_pause_ms"],
+        updates["use_chapters"],
+        updates["continuation_chain"],
+        updates["continuation_anchor_seconds"],
+        updates["max_new_tokens"],
+        updates["attn_implementation"],
+        updates["dtype"],
+        updates["x_vector_only_mode"],
+        updates["speaker_tags"],
+        _build_status_message("Preset Applied", detail),
+    )
+
+
 def run_generation(
     text_input: str,
     text_file: str | None,
@@ -1351,6 +1537,11 @@ def run_generation(
     reference_audio_path: str,
     reference_text: str,
     reference_text_file: str | None,
+    speaker2_reference_audio_file: str | None,
+    speaker2_reference_audio_path: str,
+    speaker2_reference_text: str,
+    speaker2_reference_text_file: str | None,
+    speaker_tags: bool,
     x_vector_only_mode: bool,
     resume_state_file: str | None,
     output_name: str,
@@ -1436,6 +1627,20 @@ def run_generation(
         reference_text_file_path = _stage_file(
             reference_text_file, staging_dir, "reference_text"
         )
+        speaker2_reference_text_file_path = _stage_file(
+            speaker2_reference_text_file, staging_dir, "speaker2_reference_text"
+        )
+
+        speaker2_reference_audio_value: str | None = None
+        if speaker2_reference_audio_file:
+            staged_speaker2_audio = _stage_file(
+                speaker2_reference_audio_file, staging_dir, "speaker2_reference_audio"
+            )
+            speaker2_reference_audio_value = (
+                str(staged_speaker2_audio) if staged_speaker2_audio else None
+            )
+        elif speaker2_reference_audio_path.strip():
+            speaker2_reference_audio_value = speaker2_reference_audio_path.strip()
 
         if not resume_state_path and not text_path:
             message = "Provide book text (paste text or upload a .txt file), or upload a resume state."
@@ -1470,6 +1675,14 @@ def run_generation(
             )
             yield _build_status_message("Missing continuation transcript", message), None, None, message, telemetry_html()
             return
+        if (
+            str(tts_backend or "").strip().lower() == "moss-ttsd"
+            and not resume_state_path
+            and not speaker2_reference_audio_value
+        ):
+            message = "MOSS-TTSD dialogue mode requires Speaker 2 reference audio."
+            yield _build_status_message("Missing Speaker 2 reference", message), None, None, message, telemetry_html()
+            return
 
         if text_path:
             command.extend(["--text-file", str(text_path)])
@@ -1481,6 +1694,16 @@ def run_generation(
             command.extend(["--reference-text", reference_text.strip()])
         elif reference_text_file_path:
             command.extend(["--reference-text-file", str(reference_text_file_path)])
+        if speaker2_reference_audio_value:
+            command.extend(["--speaker2-reference-audio", speaker2_reference_audio_value])
+        if speaker2_reference_text.strip():
+            command.extend(["--speaker2-reference-text", speaker2_reference_text.strip()])
+        elif speaker2_reference_text_file_path:
+            command.extend(
+                ["--speaker2-reference-text-file", str(speaker2_reference_text_file_path)]
+            )
+        if speaker_tags:
+            command.append("--speaker-tags")
 
         if x_vector_only_mode:
             command.append("--x-vector-only-mode")
@@ -1724,6 +1947,12 @@ def build_demo() -> gr.Blocks:
         "Custom Word + Number",
         "Custom Regex",
     ]
+    generation_presets = [
+        "MOSS Long-form (Default)",
+        "MOSS Stable (GPU-safe)",
+        "MOSS Dialogue (TTSD)",
+        "Qwen Clone",
+    ]
 
     with gr.Blocks(
         title="MOSS/Qwen Audiobook Studio",
@@ -1736,153 +1965,236 @@ def build_demo() -> gr.Blocks:
         )
         with gr.Row(elem_classes=["app-shell"]):
             with gr.Column(scale=2):
-                gr.Markdown("### Input")
-                text_input = gr.Textbox(
-                    label="Book Text (optional)",
-                    placeholder="Paste text here, or upload a .txt file below.",
-                    lines=12,
-                )
-                text_file = gr.File(
-                    label="Book Text File (.txt)",
-                    file_types=[".txt"],
-                    type="filepath",
-                )
-                reference_audio_file = gr.File(
-                    label="Reference Audio File",
-                    file_types=audio_types,
-                    type="filepath",
-                )
-                reference_audio_path = gr.Textbox(
-                    label="Reference Audio Path or URL (optional)",
-                    placeholder="Use this if you do not upload audio.",
-                )
-                reference_text = gr.Textbox(
-                    label="Reference Transcript (optional)",
-                    placeholder="Required unless X-Vector only mode is enabled.",
-                    lines=4,
-                )
-                reference_text_file = gr.File(
-                    label="Reference Transcript File (.txt)",
-                    file_types=[".txt"],
-                    type="filepath",
-                )
+                gr.Markdown("### Workflow")
                 with gr.Row():
-                    voice_library_dropdown = gr.Dropdown(
-                        label="Voice Library (/voices)",
-                        choices=voice_library_choices,
-                        value=None,
+                    workflow_mode = gr.Dropdown(
+                        label="Workflow Mode",
+                        choices=[
+                            ("Single Speaker", "single"),
+                            ("Dialogue (2 Speakers / TTSD)", "dialogue"),
+                        ],
+                        value="single",
                         allow_custom_value=False,
-                        scale=5,
-                    )
-                    voice_library_refresh_button = gr.Button("Refresh", scale=1, variant="secondary")
-                with gr.Row():
-                    voice_library_apply_button = gr.Button(
-                        "Use Selected Voice",
-                        variant="secondary",
                         scale=2,
                     )
-                    voice_library_status = gr.Markdown(
-                        f"Using `{_ensure_voices_dir()}` for voice files.",
+                    generation_preset = gr.Dropdown(
+                        label="Quick Preset",
+                        choices=generation_presets,
+                        value=generation_presets[0],
+                        scale=3,
                     )
-                x_vector_only_mode = gr.Checkbox(
-                    label="X-Vector Only Mode (no transcript required)",
-                    value=False,
+                    apply_generation_preset_button = gr.Button(
+                        "Apply Preset",
+                        variant="secondary",
+                        scale=1,
+                    )
+                workflow_mode_status = gr.Markdown(
+                    _build_status_message(
+                        "Workflow Mode",
+                        "Single-speaker mode is active. Extra speaker controls are hidden to reduce clutter.",
+                    )
                 )
-                resume_state_file = gr.File(
-                    label="Resume State (session_state.json, optional)",
-                    file_types=[".json"],
-                    type="filepath",
-                )
+                generation_preset_status = gr.Markdown("### Preset Applied\n\nNo preset applied yet.")
+
+                with gr.Tabs():
+                    with gr.Tab("Book"):
+                        text_input = gr.Textbox(
+                            label="Book Text (optional)",
+                            placeholder="Paste text here, or upload a .txt file below.",
+                            lines=14,
+                        )
+                        text_file = gr.File(
+                            label="Book Text File (.txt)",
+                            file_types=[".txt"],
+                            type="filepath",
+                        )
+
+                    with gr.Tab("Speaker 1"):
+                        reference_audio_file = gr.File(
+                            label="Reference Audio File (Speaker 1)",
+                            file_types=audio_types,
+                            type="filepath",
+                        )
+                        reference_audio_path = gr.Textbox(
+                            label="Reference Audio Path or URL (Speaker 1)",
+                            placeholder="Use this if you do not upload audio.",
+                        )
+                        x_vector_only_mode = gr.Checkbox(
+                            label="X-Vector Only Mode (hide transcript fields)",
+                            value=False,
+                        )
+                        reference_transcript_group = gr.Group(visible=True)
+                        with reference_transcript_group:
+                            reference_text = gr.Textbox(
+                                label="Reference Transcript (Speaker 1, optional)",
+                                placeholder="Required for qwen unless X-Vector only mode is enabled.",
+                                lines=4,
+                            )
+                            reference_text_file = gr.File(
+                                label="Reference Transcript File (.txt, Speaker 1)",
+                                file_types=[".txt"],
+                                type="filepath",
+                            )
+                        reference_inputs_status = gr.Markdown(
+                            _build_status_message("Reference Inputs", "Reference transcript fields are visible.")
+                        )
+                        with gr.Row():
+                            voice_library_dropdown = gr.Dropdown(
+                                label="Voice Library (/voices)",
+                                choices=voice_library_choices,
+                                value=None,
+                                allow_custom_value=False,
+                                scale=5,
+                            )
+                            voice_library_refresh_button = gr.Button("Refresh", scale=1, variant="secondary")
+                        with gr.Row():
+                            voice_library_apply_button = gr.Button(
+                                "Use Selected Voice (Speaker 1)",
+                                variant="secondary",
+                                scale=2,
+                            )
+                            voice_library_status = gr.Markdown(
+                                f"Using `{_ensure_voices_dir()}` for voice files.",
+                            )
+
+                    with gr.Tab("Speaker 2 (Dialogue)"):
+                        speaker2_group = gr.Group(visible=False)
+                        with speaker2_group:
+                            gr.Markdown(
+                                "Visible in Dialogue mode / `moss-ttsd`. Provide speaker-2 reference audio "
+                                "and transcript for native two-speaker generation."
+                            )
+                            speaker2_reference_audio_file = gr.File(
+                                label="Speaker 2 Reference Audio File",
+                                file_types=audio_types,
+                                type="filepath",
+                            )
+                            speaker2_reference_audio_path = gr.Textbox(
+                                label="Speaker 2 Reference Audio Path or URL",
+                                placeholder="Use this if you do not upload audio.",
+                            )
+                            speaker2_reference_text = gr.Textbox(
+                                label="Speaker 2 Transcript (optional but recommended)",
+                                lines=4,
+                            )
+                            speaker2_reference_text_file = gr.File(
+                                label="Speaker 2 Transcript File (.txt)",
+                                file_types=[".txt"],
+                                type="filepath",
+                            )
+                            speaker_tags = gr.Checkbox(
+                                label="Enable [S1]/[S2] speaker tags in text",
+                                value=False,
+                            )
+
+                    with gr.Tab("Resume"):
+                        resume_state_file = gr.File(
+                            label="Resume State (session_state.json, optional)",
+                            file_types=[".json"],
+                            type="filepath",
+                        )
+                        gr.Markdown(
+                            "Resume state can continue an interrupted run. In resume mode, some inputs may "
+                            "be read from the saved session state."
+                        )
 
             with gr.Column(scale=1):
-                gr.Markdown("### Output and Runtime")
-                output_name = gr.Textbox(label="Output Filename", value="audiobook.mp3")
-                run_root = gr.Textbox(label="Run Root Folder", value=str(DEFAULT_RUN_ROOT.resolve()))
+                gr.Markdown("### Runtime Settings")
+                with gr.Tabs():
+                    with gr.Tab("Output"):
+                        output_name = gr.Textbox(label="Output Filename", value="audiobook.mp3")
+                        run_root = gr.Textbox(
+                            label="Run Root Folder",
+                            value=str(DEFAULT_RUN_ROOT.resolve()),
+                        )
+                        language = gr.Dropdown(
+                            label="Language",
+                            choices=["Auto", "English", "Chinese", "Japanese", "Korean"],
+                            value="Auto",
+                            allow_custom_value=True,
+                        )
+                        use_chapters = gr.Checkbox(label="Embed chapter metadata", value=True)
+                        mp3_quality = gr.Slider(
+                            label="MP3 quality (0 best, 9 smallest)",
+                            minimum=0,
+                            maximum=9,
+                            step=1,
+                            value=0,
+                        )
 
-                max_chars_per_batch = gr.Slider(
-                    label="Max chars per batch",
-                    minimum=100,
-                    maximum=5000,
-                    step=50,
-                    value=DEFAULT_MAX_CHARS,
-                )
-                pause_ms = gr.Slider(
-                    label="Pause between batches (ms)",
-                    minimum=0,
-                    maximum=5000,
-                    step=25,
-                    value=DEFAULT_PAUSE_MS,
-                )
-                chapter_pause_ms = gr.Slider(
-                    label="Additional chapter pause (ms)",
-                    minimum=0,
-                    maximum=8000,
-                    step=25,
-                    value=DEFAULT_CHAPTER_PAUSE_MS,
-                )
-                mp3_quality = gr.Slider(
-                    label="MP3 quality (0 best, 9 smallest)",
-                    minimum=0,
-                    maximum=9,
-                    step=1,
-                    value=0,
-                )
-                use_chapters = gr.Checkbox(label="Embed chapter metadata", value=True)
-                language = gr.Dropdown(
-                    label="Language",
-                    choices=["Auto", "English", "Chinese", "Japanese", "Korean"],
-                    value="Auto",
-                    allow_custom_value=True,
-                )
+                    with gr.Tab("Chunking"):
+                        max_chars_per_batch = gr.Slider(
+                            label="Max chars per batch",
+                            minimum=100,
+                            maximum=5000,
+                            step=50,
+                            value=DEFAULT_MAX_CHARS,
+                        )
+                        pause_ms = gr.Slider(
+                            label="Pause between batches (ms)",
+                            minimum=0,
+                            maximum=5000,
+                            step=25,
+                            value=DEFAULT_PAUSE_MS,
+                        )
+                        chapter_pause_ms = gr.Slider(
+                            label="Additional chapter pause (ms)",
+                            minimum=0,
+                            maximum=8000,
+                            step=25,
+                            value=DEFAULT_CHAPTER_PAUSE_MS,
+                        )
 
-                with gr.Accordion("Advanced", open=False):
-                    tts_backend = gr.Dropdown(
-                        label="TTS backend",
-                        choices=["moss-delay", "moss-local", "moss-ttsd", "qwen", "auto"],
-                        value=DEFAULT_TTS_BACKEND,
-                    )
-                    model_id = gr.Textbox(label="Model ID", value=DEFAULT_MODEL_ID)
-                    device = gr.Textbox(label="Device", value="cuda:0")
-                    dtype = gr.Dropdown(
-                        label="DType",
-                        choices=["float16", "bfloat16", "float32"],
-                        value=DEFAULT_DTYPE,
-                    )
-                    attn_implementation = gr.Dropdown(
-                        label="Attention implementation",
-                        choices=["sdpa", "flash_attention_2"],
-                        value=DEFAULT_ATTN_IMPLEMENTATION,
-                    )
-                    inference_batch_size = gr.Slider(
-                        label="Inference batch size (0 = auto)",
-                        minimum=0,
-                        maximum=16,
-                        step=1,
-                        value=0,
-                    )
-                    max_new_tokens = gr.Slider(
-                        label="Max new tokens (MOSS)",
-                        minimum=256,
-                        maximum=16384,
-                        step=128,
-                        value=DEFAULT_MAX_NEW_TOKENS,
-                    )
-                    continuation_chain = gr.Checkbox(
-                        label="Continuation chain (best continuity, slower)",
-                        value=False,
-                    )
-                    continuation_anchor_seconds = gr.Slider(
-                        label="Continuation anchor seconds",
-                        minimum=2.0,
-                        maximum=30.0,
-                        step=0.5,
-                        value=DEFAULT_CONTINUATION_ANCHOR_SECONDS,
-                    )
-                    stop_after_batch = gr.Number(
-                        label="Stop after batch (testing)",
-                        value=0,
-                        precision=0,
-                    )
+                    with gr.Tab("Engine"):
+                        tts_backend = gr.Dropdown(
+                            label="TTS backend",
+                            choices=["moss-delay", "moss-local", "moss-ttsd", "qwen", "auto"],
+                            value=DEFAULT_TTS_BACKEND,
+                        )
+                        model_id = gr.Textbox(label="Model ID", value=DEFAULT_MODEL_ID)
+                        device = gr.Textbox(label="Device", value="cuda:0")
+                        dtype = gr.Dropdown(
+                            label="DType",
+                            choices=["float16", "bfloat16", "float32"],
+                            value=DEFAULT_DTYPE,
+                        )
+                        attn_implementation = gr.Dropdown(
+                            label="Attention implementation",
+                            choices=["sdpa", "flash_attention_2", "eager"],
+                            value=DEFAULT_ATTN_IMPLEMENTATION,
+                        )
+                        inference_batch_size = gr.Slider(
+                            label="Inference batch size (0 = auto)",
+                            minimum=0,
+                            maximum=16,
+                            step=1,
+                            value=0,
+                        )
+                        max_new_tokens = gr.Slider(
+                            label="Max new tokens (MOSS)",
+                            minimum=256,
+                            maximum=16384,
+                            step=128,
+                            value=DEFAULT_MAX_NEW_TOKENS,
+                        )
+
+                    with gr.Tab("Continuity / Debug"):
+                        continuation_chain = gr.Checkbox(
+                            label="Continuation chain (best continuity, slower; MOSS classic only)",
+                            value=False,
+                        )
+                        continuation_anchor_seconds = gr.Slider(
+                            label="Continuation anchor seconds",
+                            minimum=2.0,
+                            maximum=30.0,
+                            step=0.5,
+                            value=DEFAULT_CONTINUATION_ANCHOR_SECONDS,
+                        )
+                        stop_after_batch = gr.Number(
+                            label="Stop after batch (testing)",
+                            value=0,
+                            precision=0,
+                        )
 
         with gr.Row():
             run_button = gr.Button("Generate Audiobook", variant="primary", size="lg")
@@ -2042,6 +2354,11 @@ def build_demo() -> gr.Blocks:
                 reference_audio_path,
                 reference_text,
                 reference_text_file,
+                speaker2_reference_audio_file,
+                speaker2_reference_audio_path,
+                speaker2_reference_text,
+                speaker2_reference_text_file,
+                speaker_tags,
                 x_vector_only_mode,
                 resume_state_file,
                 output_name,
@@ -2090,6 +2407,52 @@ def build_demo() -> gr.Blocks:
         voice_library_refresh_button.click(
             fn=refresh_voice_library_dropdown,
             outputs=[voice_library_dropdown, voice_library_status],
+        )
+        apply_preset_event = apply_generation_preset_button.click(
+            fn=apply_run_preset,
+            inputs=[generation_preset],
+            outputs=[
+                workflow_mode,
+                tts_backend,
+                model_id,
+                inference_batch_size,
+                max_chars_per_batch,
+                pause_ms,
+                chapter_pause_ms,
+                use_chapters,
+                continuation_chain,
+                continuation_anchor_seconds,
+                max_new_tokens,
+                attn_implementation,
+                dtype,
+                x_vector_only_mode,
+                speaker_tags,
+                generation_preset_status,
+            ],
+        )
+        apply_preset_event.then(
+            fn=update_workflow_visibility,
+            inputs=[workflow_mode, tts_backend, speaker_tags],
+            outputs=[speaker2_group, speaker_tags, workflow_mode_status],
+        ).then(
+            fn=update_reference_transcript_visibility,
+            inputs=[x_vector_only_mode],
+            outputs=[reference_transcript_group, reference_inputs_status],
+        )
+        workflow_mode.change(
+            fn=update_workflow_visibility,
+            inputs=[workflow_mode, tts_backend, speaker_tags],
+            outputs=[speaker2_group, speaker_tags, workflow_mode_status],
+        )
+        tts_backend.change(
+            fn=update_workflow_visibility,
+            inputs=[workflow_mode, tts_backend, speaker_tags],
+            outputs=[speaker2_group, speaker_tags, workflow_mode_status],
+        )
+        x_vector_only_mode.change(
+            fn=update_reference_transcript_visibility,
+            inputs=[x_vector_only_mode],
+            outputs=[reference_transcript_group, reference_inputs_status],
         )
         voice_lab_refresh_button.click(
             fn=refresh_voice_library_dropdown,
