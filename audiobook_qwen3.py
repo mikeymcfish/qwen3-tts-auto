@@ -191,6 +191,16 @@ def is_moss_backend(backend: str) -> bool:
     return is_moss_classic_backend(backend) or is_moss_ttsd_backend(backend)
 
 
+def is_unused_audio_generate_kwargs_error(exc: BaseException) -> bool:
+    if not isinstance(exc, ValueError):
+        return False
+    message = str(exc)
+    return (
+        "The following `model_kwargs` are not used by the model" in message
+        and "audio_" in message
+    )
+
+
 def recommended_default_model_id(backend: str) -> str:
     return DEFAULT_MODEL_ID_BY_BACKEND.get(backend, DEFAULT_MODEL_ID)
 
@@ -3226,17 +3236,30 @@ def main() -> int:
                         packed = processor(conversations, mode=mode)
                         input_ids = packed["input_ids"].to(torch_device)
                         attention_mask = packed["attention_mask"].to(torch_device)
-                        outputs = model.generate(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            max_new_tokens=max_new_tokens,
-                            audio_temperature=float(DEFAULT_MOSS_AUDIO_TEMPERATURE),
-                            audio_top_p=float(DEFAULT_MOSS_AUDIO_TOP_P),
-                            audio_top_k=int(DEFAULT_MOSS_AUDIO_TOP_K),
-                            audio_repetition_penalty=float(
+                        generate_kwargs = {
+                            "input_ids": input_ids,
+                            "attention_mask": attention_mask,
+                            "max_new_tokens": max_new_tokens,
+                            "audio_temperature": float(DEFAULT_MOSS_AUDIO_TEMPERATURE),
+                            "audio_top_p": float(DEFAULT_MOSS_AUDIO_TOP_P),
+                            "audio_top_k": int(DEFAULT_MOSS_AUDIO_TOP_K),
+                            "audio_repetition_penalty": float(
                                 DEFAULT_MOSS_AUDIO_REPETITION_PENALTY
                             ),
-                        )
+                        }
+                        try:
+                            outputs = model.generate(**generate_kwargs)
+                        except ValueError as exc:
+                            if not is_unused_audio_generate_kwargs_error(exc):
+                                raise
+                            for key in (
+                                "audio_temperature",
+                                "audio_top_p",
+                                "audio_top_k",
+                                "audio_repetition_penalty",
+                            ):
+                                generate_kwargs.pop(key, None)
+                            outputs = model.generate(**generate_kwargs)
                         return processor.decode(outputs)
 
                     if progress.enabled:

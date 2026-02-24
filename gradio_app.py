@@ -39,6 +39,7 @@ from audiobook_qwen3 import (
     choose_attention_implementation,
     choose_dtype,
     extract_chapter_titles_from_raw_text,
+    is_unused_audio_generate_kwargs_error,
     require_runtime_dependencies,
     split_into_paragraphs,
 )
@@ -739,6 +740,294 @@ def refresh_voice_library_dropdown() -> tuple[dict[str, Any], str]:
     return gr.update(choices=choices, value=None), summary
 
 
+def _voice_library_inventory_markdown() -> str:
+    voices_dir = _ensure_voices_dir()
+    entries = _scan_voice_library_entries()
+    if not entries:
+        return f"### Voice Inventory\n\nNo voice files found yet in `{voices_dir}`."
+
+    lines = [
+        f"### Voice Inventory ({len(entries)} file(s))",
+        "",
+        f"Folder: `{voices_dir}`",
+        "",
+    ]
+    for entry in entries:
+        try:
+            name = Path(entry.get("value", "")).name
+        except Exception:
+            name = str(entry.get("value", ""))
+        kind = str(entry.get("kind", "file"))
+        lines.append(f"- `{name}` ({kind})")
+    return "\n".join(lines)
+
+
+def inspect_voice_library_selection_for_preview(
+    selected_value: str | None,
+) -> tuple[str | None, str, str | None, str, str]:
+    if not selected_value:
+        return (
+            None,
+            "",
+            None,
+            "",
+            "Select a voice file to preview.",
+        )
+
+    selected_path = Path(selected_value).expanduser()
+    if not selected_path.exists():
+        return (
+            None,
+            "",
+            None,
+            "",
+            f"Selected file does not exist: {selected_path}",
+        )
+
+    try:
+        selected_path = selected_path.resolve()
+    except Exception:
+        pass
+
+    selected_file_value = str(selected_path)
+    preview_audio_value: str | None = None
+    preview_text_value = ""
+    metadata_text_value = ""
+    inspector_status = f"Loaded `{selected_path.name}`"
+
+    metadata: dict[str, Any] = {}
+    if _is_voice_metadata_file(selected_path):
+        metadata = _load_voice_metadata(selected_path)
+        if metadata:
+            metadata_text_value = json.dumps(metadata, indent=2, ensure_ascii=True)
+
+        preview_audio_candidate: Path | None = None
+        preview_audio_raw = metadata.get("preview_audio")
+        if isinstance(preview_audio_raw, str) and preview_audio_raw.strip():
+            candidate = Path(preview_audio_raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = selected_path.parent / candidate
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                pass
+            if candidate.exists():
+                preview_audio_candidate = candidate
+
+        if preview_audio_candidate is None:
+            for suffix in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"):
+                candidate = selected_path.with_suffix(suffix)
+                if candidate.exists():
+                    preview_audio_candidate = candidate
+                    break
+
+        if preview_audio_candidate is not None:
+            preview_audio_value = str(preview_audio_candidate)
+
+        preview_text_raw = metadata.get("preview_text")
+        if isinstance(preview_text_raw, str) and preview_text_raw.strip():
+            preview_text_value = preview_text_raw.strip()
+        else:
+            preview_text_file_raw = metadata.get("preview_text_file")
+            transcript_candidate: Path | None = None
+            if isinstance(preview_text_file_raw, str) and preview_text_file_raw.strip():
+                candidate = Path(preview_text_file_raw).expanduser()
+                if not candidate.is_absolute():
+                    candidate = selected_path.parent / candidate
+                try:
+                    candidate = candidate.resolve()
+                except Exception:
+                    pass
+                transcript_candidate = candidate
+            if transcript_candidate is None and preview_audio_candidate is not None:
+                transcript_candidate = preview_audio_candidate.with_suffix(".txt")
+            if transcript_candidate is None:
+                transcript_candidate = selected_path.with_suffix(".txt")
+            if transcript_candidate.exists():
+                preview_text_value = _read_text_file_best_effort(transcript_candidate) or ""
+
+        inspector_status = (
+            f"Voice preset: `{selected_path.name}`"
+            + (f" | preview audio: `{Path(preview_audio_value).name}`" if preview_audio_value else " | no preview audio found")
+        )
+        return (
+            preview_audio_value,
+            preview_text_value,
+            selected_file_value,
+            metadata_text_value,
+            inspector_status,
+        )
+
+    if selected_path.suffix.lower() in REFERENCE_AUDIO_EXTENSIONS:
+        preview_audio_value = str(selected_path)
+        transcript_path = selected_path.with_suffix(".txt")
+        preview_text_value = _read_text_file_best_effort(transcript_path) or ""
+
+        sidecar_meta_path = selected_path.with_suffix(VOICE_METADATA_SUFFIX)
+        if sidecar_meta_path.exists():
+            metadata = _load_voice_metadata(sidecar_meta_path)
+            if metadata:
+                metadata_text_value = json.dumps(metadata, indent=2, ensure_ascii=True)
+
+        transcript_note = f" + transcript `{transcript_path.name}`" if transcript_path.exists() else ""
+        inspector_status = f"Voice audio: `{selected_path.name}`{transcript_note}"
+        return (
+            preview_audio_value,
+            preview_text_value,
+            selected_file_value,
+            metadata_text_value,
+            inspector_status,
+        )
+
+    return (
+        None,
+        "",
+        selected_file_value,
+        "",
+        f"Unsupported voice file type: `{selected_path.name}`",
+    )
+
+
+def refresh_voice_library_workspace(
+    selected_value: str | None,
+) -> tuple[dict[str, Any], str, str, str | None, str, str | None, str, str]:
+    entries = _scan_voice_library_entries()
+    choices = [(entry["label"], entry["value"]) for entry in entries]
+    voices_dir = _ensure_voices_dir()
+
+    valid_values = {entry["value"] for entry in entries}
+    selected = selected_value if selected_value in valid_values else None
+    if selected is None and entries:
+        selected = entries[0]["value"]
+
+    summary = (
+        f"Voice library refreshed: {len(choices)} file(s) in `{voices_dir}`."
+        if choices
+        else f"No voice files found yet in `{voices_dir}`."
+    )
+    inventory_md = _voice_library_inventory_markdown()
+    preview_audio, preview_text, selected_file, metadata_text, inspector_status = (
+        inspect_voice_library_selection_for_preview(selected)
+    )
+
+    return (
+        gr.update(choices=choices, value=selected),
+        summary,
+        inventory_md,
+        preview_audio,
+        preview_text,
+        selected_file,
+        metadata_text,
+        inspector_status,
+    )
+
+
+def import_voice_library_files(
+    uploaded_files: str | list[str] | None,
+    overwrite_existing: bool,
+    selected_value: str | None,
+) -> tuple[str, dict[str, Any], str, str, str | None, str, str | None, str, str, dict[str, Any]]:
+    voices_dir = _ensure_voices_dir()
+    files: list[str] = []
+    if isinstance(uploaded_files, str):
+        files = [uploaded_files]
+    elif isinstance(uploaded_files, list):
+        files = [str(item) for item in uploaded_files if item]
+
+    if not files:
+        refreshed = refresh_voice_library_workspace(selected_value)
+        return (
+            _build_status_message("Voice Import", "Select one or more files to import."),
+            *refreshed,
+            gr.update(value=None),
+        )
+
+    imported_paths: list[str] = []
+    skipped: list[str] = []
+    copied_names: list[str] = []
+
+    for raw_path in files:
+        src = Path(raw_path).expanduser()
+        if not src.exists() or not src.is_file():
+            skipped.append(f"missing: {raw_path}")
+            continue
+
+        lower_name = src.name.lower()
+        suffix = src.suffix.lower()
+        is_supported = (
+            suffix in REFERENCE_AUDIO_EXTENSIONS
+            or suffix == ".txt"
+            or lower_name.endswith(VOICE_METADATA_SUFFIX)
+            or suffix == ".json"
+        )
+        if not is_supported:
+            skipped.append(f"unsupported: {src.name}")
+            continue
+
+        target = voices_dir / src.name
+        if target.exists():
+            try:
+                same_file = target.resolve() == src.resolve()
+            except Exception:
+                same_file = False
+            if same_file:
+                skipped.append(f"already in /voices: {src.name}")
+                continue
+
+            if overwrite_existing:
+                pass
+            else:
+                if target.name.lower().endswith(VOICE_METADATA_SUFFIX):
+                    stem = target.name[: -len(VOICE_METADATA_SUFFIX)]
+                    suffix_text = VOICE_METADATA_SUFFIX
+                else:
+                    stem = target.stem
+                    suffix_text = target.suffix
+                counter = 2
+                while target.exists():
+                    target = voices_dir / f"{stem}_{counter}{suffix_text}"
+                    counter += 1
+
+        shutil.copy2(src, target)
+        imported_paths.append(str(target.resolve()))
+        copied_names.append(target.name)
+
+    preferred_selection = selected_value
+    if imported_paths:
+        preferred_selection = imported_paths[-1]
+
+    refreshed = refresh_voice_library_workspace(preferred_selection)
+    imported_count = len(imported_paths)
+    skipped_count = len(skipped)
+
+    if imported_count == 0:
+        detail = "No files were imported."
+        if skipped:
+            detail += "\n\n" + "\n".join(f"- {line}" for line in skipped[:12])
+        status_md = _build_status_message("Voice Import", detail)
+    else:
+        detail_lines = [
+            f"Imported {imported_count} file(s) into `{voices_dir}`.",
+            "",
+            "Files:",
+            *[f"- `{name}`" for name in copied_names[:12]],
+        ]
+        if len(copied_names) > 12:
+            detail_lines.append(f"- ... and {len(copied_names) - 12} more")
+        if skipped_count:
+            detail_lines.extend(["", f"Skipped {skipped_count} file(s)."])
+            detail_lines.extend(f"- {line}" for line in skipped[:8])
+            if len(skipped) > 8:
+                detail_lines.append(f"- ... and {len(skipped) - 8} more")
+        status_md = _build_status_message("Voice Import", "\n".join(detail_lines))
+
+    return (
+        status_md,
+        *refreshed,
+        gr.update(value=None),
+    )
+
+
 def _load_voice_metadata(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -753,18 +1042,43 @@ def apply_voice_library_selection(
     current_reference_text: str,
     current_voice_lab_name: str,
     current_voice_lab_description: str,
-) -> tuple[str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str | None, str, str | None, str, str]:
     ref_audio = current_reference_audio_path
     ref_text = current_reference_text
     voice_name = current_voice_lab_name
     voice_description = current_voice_lab_description
+    preview_audio, preview_text, preview_file, metadata_text, inspector_status = (
+        inspect_voice_library_selection_for_preview(selected_value)
+    )
 
     if not selected_value:
-        return ref_audio, ref_text, voice_name, voice_description, "Select a file from /voices first."
+        return (
+            ref_audio,
+            ref_text,
+            voice_name,
+            voice_description,
+            "Select a file from /voices first.",
+            preview_audio,
+            preview_text,
+            preview_file,
+            metadata_text,
+            inspector_status,
+        )
 
     selected_path = Path(selected_value).expanduser()
     if not selected_path.exists():
-        return ref_audio, ref_text, voice_name, voice_description, f"Selected file does not exist: {selected_path}"
+        return (
+            ref_audio,
+            ref_text,
+            voice_name,
+            voice_description,
+            f"Selected file does not exist: {selected_path}",
+            preview_audio,
+            preview_text,
+            preview_file,
+            metadata_text,
+            inspector_status,
+        )
 
     try:
         selected_path = selected_path.resolve()
@@ -780,7 +1094,18 @@ def apply_voice_library_selection(
         message = f"Loaded audio voice reference: `{selected_path.name}`"
         if transcript_text is not None:
             message += f" (+ transcript `{transcript_path.name}`)"
-        return ref_audio, ref_text, voice_name, voice_description, message
+        return (
+            ref_audio,
+            ref_text,
+            voice_name,
+            voice_description,
+            message,
+            preview_audio,
+            preview_text,
+            preview_file,
+            metadata_text,
+            inspector_status,
+        )
 
     if _is_voice_metadata_file(selected_path):
         metadata = _load_voice_metadata(selected_path)
@@ -817,9 +1142,25 @@ def apply_voice_library_selection(
             voice_name,
             voice_description,
             f"Loaded voice preset: `{selected_path.name}`",
+            preview_audio,
+            preview_text,
+            preview_file,
+            metadata_text,
+            inspector_status,
         )
 
-    return ref_audio, ref_text, voice_name, voice_description, f"Unsupported voice file type: `{selected_path.name}`"
+    return (
+        ref_audio,
+        ref_text,
+        voice_name,
+        voice_description,
+        f"Unsupported voice file type: `{selected_path.name}`",
+        preview_audio,
+        preview_text,
+        preview_file,
+        metadata_text,
+        inspector_status,
+    )
 
 
 def _extract_audio_waveforms_from_decoded(
@@ -1050,16 +1391,24 @@ def generate_voice_from_description(
 
         log("generating audio...")
         with torch.inference_mode():
+            generate_kwargs = {
+                **model_inputs,
+                "max_new_tokens": int(max_new_tokens),
+                "audio_temperature": float(DEFAULT_MOSS_AUDIO_TEMPERATURE),
+                "audio_top_p": float(DEFAULT_MOSS_AUDIO_TOP_P),
+                "audio_top_k": int(DEFAULT_MOSS_AUDIO_TOP_K),
+                "audio_repetition_penalty": float(DEFAULT_MOSS_AUDIO_REPETITION_PENALTY),
+            }
             try:
+                outputs = model.generate(**generate_kwargs)
+            except TypeError:
                 outputs = model.generate(
                     **model_inputs,
                     max_new_tokens=int(max_new_tokens),
-                    audio_temperature=float(DEFAULT_MOSS_AUDIO_TEMPERATURE),
-                    audio_top_p=float(DEFAULT_MOSS_AUDIO_TOP_P),
-                    audio_top_k=int(DEFAULT_MOSS_AUDIO_TOP_K),
-                    audio_repetition_penalty=float(DEFAULT_MOSS_AUDIO_REPETITION_PENALTY),
                 )
-            except TypeError:
+            except ValueError as exc:
+                if not is_unused_audio_generate_kwargs_error(exc):
+                    raise
                 outputs = model.generate(
                     **model_inputs,
                     max_new_tokens=int(max_new_tokens),
@@ -1715,6 +2064,14 @@ def build_demo() -> gr.Blocks:
     """
     audio_types = sorted(REFERENCE_AUDIO_EXTENSIONS)
     voice_library_choices = _voice_dropdown_choices()
+    initial_voice_library_value = voice_library_choices[0][1] if voice_library_choices else None
+    (
+        initial_voice_library_preview_audio,
+        initial_voice_library_preview_text,
+        initial_voice_library_selected_file,
+        initial_voice_library_metadata_text,
+        initial_voice_library_inspector_status,
+    ) = inspect_voice_library_selection_for_preview(initial_voice_library_value)
     chapter_regex_presets = [
         "Common Headings",
         "Chapter Number",
@@ -1734,263 +2091,411 @@ def build_demo() -> gr.Blocks:
             "## MOSS/Qwen Audiobook Studio\n"
             "Generate audiobooks with chapter tags, pause controls, adaptive inference batching, and MP3 chapter metadata."
         )
+        status = gr.Markdown("### Ready")
+        with gr.Row(elem_classes=["app-shell"]):
+            with gr.Column(scale=3):
+                telemetry = gr.HTML(
+                    value=_render_telemetry_panel(
+                        log_lines=[],
+                        command=None,
+                        job_root=None,
+                        run_root=DEFAULT_RUN_ROOT.resolve(),
+                        expected_output=None,
+                        device_hint="cuda:0",
+                        started_at=None,
+                        process_pid=None,
+                        cache={},
+                    )
+                )
+            with gr.Column(scale=2):
+                logs = gr.Textbox(label="Run Log", lines=18, elem_classes=["mono-log"])
+
         with gr.Row(elem_classes=["app-shell"]):
             with gr.Column(scale=2):
-                gr.Markdown("### Input")
-                text_input = gr.Textbox(
-                    label="Book Text (optional)",
-                    placeholder="Paste text here, or upload a .txt file below.",
-                    lines=12,
-                )
-                text_file = gr.File(
-                    label="Book Text File (.txt)",
-                    file_types=[".txt"],
-                    type="filepath",
-                )
-                reference_audio_file = gr.File(
-                    label="Reference Audio File",
-                    file_types=audio_types,
-                    type="filepath",
-                )
-                reference_audio_path = gr.Textbox(
-                    label="Reference Audio Path or URL (optional)",
-                    placeholder="Use this if you do not upload audio.",
-                )
-                reference_text = gr.Textbox(
-                    label="Reference Transcript (optional)",
-                    placeholder="Required unless X-Vector only mode is enabled.",
-                    lines=4,
-                )
-                reference_text_file = gr.File(
-                    label="Reference Transcript File (.txt)",
-                    file_types=[".txt"],
-                    type="filepath",
-                )
-                with gr.Row():
-                    voice_library_dropdown = gr.Dropdown(
-                        label="Voice Library (/voices)",
-                        choices=voice_library_choices,
-                        value=None,
-                        allow_custom_value=False,
-                        scale=5,
-                    )
-                    voice_library_refresh_button = gr.Button("Refresh", scale=1, variant="secondary")
-                with gr.Row():
-                    voice_library_apply_button = gr.Button(
-                        "Use Selected Voice",
-                        variant="secondary",
-                        scale=2,
-                    )
-                    voice_library_status = gr.Markdown(
-                        f"Using `{_ensure_voices_dir()}` for voice files.",
-                    )
-                x_vector_only_mode = gr.Checkbox(
-                    label="X-Vector Only Mode (no transcript required)",
-                    value=False,
-                )
-                resume_state_file = gr.File(
-                    label="Resume State (session_state.json, optional)",
-                    file_types=[".json"],
-                    type="filepath",
-                )
-
+                audio_output = gr.Audio(label="Output Preview", type="filepath", interactive=False)
             with gr.Column(scale=1):
-                gr.Markdown("### Output and Runtime")
-                output_name = gr.Textbox(label="Output Filename", value="audiobook.mp3")
-                run_root = gr.Textbox(label="Run Root Folder", value=str(DEFAULT_RUN_ROOT.resolve()))
-
-                max_chars_per_batch = gr.Slider(
-                    label="Max chars per batch",
-                    minimum=100,
-                    maximum=5000,
-                    step=50,
-                    value=DEFAULT_MAX_CHARS,
-                )
-                pause_ms = gr.Slider(
-                    label="Pause between batches (ms)",
-                    minimum=0,
-                    maximum=5000,
-                    step=25,
-                    value=DEFAULT_PAUSE_MS,
-                )
-                chapter_pause_ms = gr.Slider(
-                    label="Additional chapter pause (ms)",
-                    minimum=0,
-                    maximum=8000,
-                    step=25,
-                    value=DEFAULT_CHAPTER_PAUSE_MS,
-                )
-                mp3_quality = gr.Slider(
-                    label="MP3 quality (0 best, 9 smallest)",
-                    minimum=0,
-                    maximum=9,
-                    step=1,
-                    value=0,
-                )
-                use_chapters = gr.Checkbox(label="Embed chapter metadata", value=True)
-                language = gr.Dropdown(
-                    label="Language",
-                    choices=["Auto", "English", "Chinese", "Japanese", "Korean"],
-                    value="Auto",
-                    allow_custom_value=True,
-                )
-
-                with gr.Accordion("Advanced", open=False):
-                    tts_backend = gr.Dropdown(
-                        label="TTS backend",
-                        choices=["moss-delay", "moss-local", "moss-ttsd", "qwen", "auto"],
-                        value=DEFAULT_TTS_BACKEND,
-                    )
-                    model_id = gr.Textbox(label="Model ID", value=DEFAULT_MODEL_ID)
-                    device = gr.Textbox(label="Device", value="cuda:0")
-                    dtype = gr.Dropdown(
-                        label="DType",
-                        choices=["float16", "bfloat16", "float32"],
-                        value=DEFAULT_DTYPE,
-                    )
-                    attn_implementation = gr.Dropdown(
-                        label="Attention implementation",
-                        choices=["sdpa", "flash_attention_2"],
-                        value=DEFAULT_ATTN_IMPLEMENTATION,
-                    )
-                    inference_batch_size = gr.Slider(
-                        label="Inference batch size (0 = auto)",
-                        minimum=0,
-                        maximum=16,
-                        step=1,
-                        value=0,
-                    )
-                    max_new_tokens = gr.Slider(
-                        label="Max new tokens (MOSS)",
-                        minimum=256,
-                        maximum=16384,
-                        step=128,
-                        value=DEFAULT_MAX_NEW_TOKENS,
-                    )
-                    continuation_chain = gr.Checkbox(
-                        label="Continuation chain (best continuity, slower)",
-                        value=False,
-                    )
-                    continuation_anchor_seconds = gr.Slider(
-                        label="Continuation anchor seconds",
-                        minimum=2.0,
-                        maximum=30.0,
-                        step=0.5,
-                        value=DEFAULT_CONTINUATION_ANCHOR_SECONDS,
-                    )
-                    stop_after_batch = gr.Number(
-                        label="Stop after batch (testing)",
-                        value=0,
-                        precision=0,
-                    )
-
-        with gr.Row():
-            run_button = gr.Button("Generate Audiobook", variant="primary", size="lg")
-            clear_button = gr.Button("Clear Output", variant="secondary")
-
-        status = gr.Markdown("### Ready")
-        telemetry = gr.HTML(
-            value=_render_telemetry_panel(
-                log_lines=[],
-                command=None,
-                job_root=None,
-                run_root=DEFAULT_RUN_ROOT.resolve(),
-                expected_output=None,
-                device_hint="cuda:0",
-                started_at=None,
-                process_pid=None,
-                cache={},
-            )
-        )
-        audio_output = gr.Audio(label="Output Preview", type="filepath", interactive=False)
-        file_output = gr.File(label="Download Output", interactive=False)
-        logs = gr.Textbox(label="Run Log", lines=20, elem_classes=["mono-log"])
+                file_output = gr.File(label="Download Output", interactive=False)
 
         with gr.Tabs():
-            with gr.Tab("Voice Lab"):
+            with gr.Tab("1. Main Book Generation"):
                 gr.Markdown(
-                    "Preview and save a synthetic voice generated from a text description using "
-                    "MOSS VoiceGenerator. Saved voices go to `/voices` as `.wav + .txt + .voice.json`."
+                    "Primary audiobook generation controls. Edit or load book text in **5. Text Editing + Chapter Generation**, "
+                    "and manage reusable voices in **3. Voice Lab**."
                 )
-                voice_lab_status = gr.Markdown("### Voice Lab Ready")
-                with gr.Row():
-                    voice_lab_name = gr.Textbox(
-                        label="Voice Name",
-                        placeholder="e.g. warm_narrator_v1",
-                        value="voice_lab_preview",
-                    )
-                    voice_lab_overwrite = gr.Checkbox(
-                        label="Overwrite existing files",
-                        value=True,
-                    )
-                voice_lab_description = gr.Textbox(
-                    label="Voice Description",
-                    lines=4,
-                    placeholder=(
-                        "Describe the voice style (tone, age, accent, pacing, texture, emotion). "
-                        "Example: Calm middle-aged male narrator, warm tone, measured pacing, slight breathiness."
-                    ),
-                )
-                voice_lab_preview_text = gr.Textbox(
-                    label="Preview Text",
-                    lines=4,
-                    value=(
-                        "This is a voice preview generated from a text description. "
-                        "If the tone sounds right, save it and reuse it from the voices folder."
-                    ),
-                )
-                with gr.Accordion("Voice Lab Advanced", open=False):
-                    voice_lab_model_id = gr.Textbox(
-                        label="VoiceGenerator Model ID",
-                        value=DEFAULT_VOICEGEN_MODEL_ID,
-                    )
-                    with gr.Row():
-                        voice_lab_device = gr.Textbox(label="Device", value="cuda:0")
-                        voice_lab_dtype = gr.Dropdown(
-                            label="DType",
-                            choices=["float16", "bfloat16", "float32"],
-                            value=DEFAULT_DTYPE,
+                with gr.Row(elem_classes=["app-shell"]):
+                    with gr.Column(scale=2):
+                        gr.Markdown("### Reference Voice + Resume")
+                        reference_audio_file = gr.File(
+                            label="Reference Audio File",
+                            file_types=audio_types,
+                            type="filepath",
                         )
-                        voice_lab_attn = gr.Dropdown(
-                            label="Attention",
-                            choices=["sdpa", "flash_attention_2", "eager"],
-                            value=DEFAULT_ATTN_IMPLEMENTATION,
+                        reference_audio_path = gr.Textbox(
+                            label="Reference Audio Path or URL (optional)",
+                            placeholder="Use this if you do not upload audio.",
                         )
-                    voice_lab_max_new_tokens = gr.Slider(
-                        label="Max new tokens",
-                        minimum=256,
-                        maximum=8192,
-                        step=64,
-                        value=2048,
-                    )
-                with gr.Row():
-                    voice_lab_generate_button = gr.Button(
-                        "Generate Preview + Save Voice",
-                        variant="primary",
-                    )
-                    voice_lab_refresh_button = gr.Button(
-                        "Refresh /voices",
-                        variant="secondary",
-                    )
-                voice_lab_preview_audio = gr.Audio(
-                    label="Voice Preview Audio",
-                    type="filepath",
-                    interactive=False,
-                )
-                voice_lab_saved_file = gr.File(
-                    label="Saved Voice Preset (.voice.json)",
-                    interactive=False,
-                )
-                voice_lab_log = gr.Textbox(
-                    label="Voice Lab Log",
-                    lines=10,
-                    elem_classes=["mono-log"],
-                )
+                        reference_text = gr.Textbox(
+                            label="Reference Transcript (optional)",
+                            placeholder="Required unless X-Vector only mode is enabled.",
+                            lines=4,
+                        )
+                        reference_text_file = gr.File(
+                            label="Reference Transcript File (.txt)",
+                            file_types=[".txt"],
+                            type="filepath",
+                        )
+                        x_vector_only_mode = gr.Checkbox(
+                            label="X-Vector Only Mode (no transcript required)",
+                            value=False,
+                        )
+                        resume_state_file = gr.File(
+                            label="Resume State (session_state.json, optional)",
+                            file_types=[".json"],
+                            type="filepath",
+                        )
+                        gr.Markdown(
+                            "Use **3. Voice Lab** to browse `/voices`, preview voice files/presets, and import new files."
+                        )
 
-            with gr.Tab("Chapter Assist"):
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Output + Runtime")
+                        output_name = gr.Textbox(label="Output Filename", value="audiobook.mp3")
+                        run_root = gr.Textbox(label="Run Root Folder", value=str(DEFAULT_RUN_ROOT.resolve()))
+
+                        max_chars_per_batch = gr.Slider(
+                            label="Max chars per batch",
+                            minimum=100,
+                            maximum=5000,
+                            step=50,
+                            value=DEFAULT_MAX_CHARS,
+                        )
+                        pause_ms = gr.Slider(
+                            label="Pause between batches (ms)",
+                            minimum=0,
+                            maximum=5000,
+                            step=25,
+                            value=DEFAULT_PAUSE_MS,
+                        )
+                        chapter_pause_ms = gr.Slider(
+                            label="Additional chapter pause (ms)",
+                            minimum=0,
+                            maximum=8000,
+                            step=25,
+                            value=DEFAULT_CHAPTER_PAUSE_MS,
+                        )
+                        mp3_quality = gr.Slider(
+                            label="MP3 quality (0 best, 9 smallest)",
+                            minimum=0,
+                            maximum=9,
+                            step=1,
+                            value=0,
+                        )
+                        use_chapters = gr.Checkbox(label="Embed chapter metadata", value=True)
+                        language = gr.Dropdown(
+                            label="Language",
+                            choices=["Auto", "English", "Chinese", "Japanese", "Korean"],
+                            value="Auto",
+                            allow_custom_value=True,
+                        )
+
+                        with gr.Accordion("Advanced", open=False):
+                            tts_backend = gr.Dropdown(
+                                label="TTS backend",
+                                choices=["moss-delay", "moss-local", "moss-ttsd", "qwen", "auto"],
+                                value=DEFAULT_TTS_BACKEND,
+                            )
+                            model_id = gr.Textbox(label="Model ID", value=DEFAULT_MODEL_ID)
+                            device = gr.Textbox(label="Device", value="cuda:0")
+                            dtype = gr.Dropdown(
+                                label="DType",
+                                choices=["float16", "bfloat16", "float32"],
+                                value=DEFAULT_DTYPE,
+                            )
+                            attn_implementation = gr.Dropdown(
+                                label="Attention implementation",
+                                choices=["sdpa", "flash_attention_2"],
+                                value=DEFAULT_ATTN_IMPLEMENTATION,
+                            )
+                            inference_batch_size = gr.Slider(
+                                label="Inference batch size (0 = auto)",
+                                minimum=0,
+                                maximum=16,
+                                step=1,
+                                value=0,
+                            )
+                            max_new_tokens = gr.Slider(
+                                label="Max new tokens (MOSS)",
+                                minimum=256,
+                                maximum=16384,
+                                step=128,
+                                value=DEFAULT_MAX_NEW_TOKENS,
+                            )
+                            continuation_chain = gr.Checkbox(
+                                label="Continuation chain (best continuity, slower)",
+                                value=False,
+                            )
+                            continuation_anchor_seconds = gr.Slider(
+                                label="Continuation anchor seconds",
+                                minimum=2.0,
+                                maximum=30.0,
+                                step=0.5,
+                                value=DEFAULT_CONTINUATION_ANCHOR_SECONDS,
+                            )
+                            stop_after_batch = gr.Number(
+                                label="Stop after batch (testing)",
+                                value=0,
+                                precision=0,
+                            )
+
+                with gr.Row():
+                    run_button = gr.Button("Generate Audiobook", variant="primary", size="lg")
+                    clear_button = gr.Button("Clear Output", variant="secondary")
+
+            with gr.Tab("2. Multi-Speaker Generation"):
                 gr.Markdown(
-                    "Regex-assisted chapter tagging and chunk preview. Build a pattern, preview matches, "
-                    "insert `[CHAPTER]` markers, then push the text back into the main Book Text box."
+                    "Multi-speaker generation workspace. This page is organized and ready for speaker mapping/script tooling, "
+                    "but the backend generation flow is not wired yet."
+                )
+                gr.Markdown("### Multi-Speaker Script Draft")
+                gr.Textbox(
+                    label="Dialogue / Narration Script",
+                    lines=14,
+                    placeholder=(
+                        "Example:\n"
+                        "[NARRATOR] The room fell silent.\n"
+                        "[SPEAKER_A] Are you sure this will work?\n"
+                        "[SPEAKER_B] It has to."
+                    ),
+                )
+                with gr.Row():
+                    gr.Textbox(
+                        label="Speaker Map (notes)",
+                        lines=8,
+                        placeholder="SPEAKER_A -> warm_narrator_v1\nSPEAKER_B -> calm_female_v2",
+                    )
+                    gr.Markdown(
+                        "### Planned Controls\n\n"
+                        "- Speaker-to-voice assignment\n"
+                        "- Per-speaker style overrides\n"
+                        "- Scene/chapter export\n"
+                        "- Batch render queue"
+                    )
+
+            with gr.Tab("3. Voice Lab"):
+                gr.Markdown(
+                    "Voice Lab includes voice generation plus a `/voices` browser so you can preview existing voices, "
+                    "import new files, and apply a selected voice to the main generation page."
+                )
+                with gr.Row(elem_classes=["app-shell"]):
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Voice Library Browser")
+                        with gr.Row():
+                            voice_library_dropdown = gr.Dropdown(
+                                label="Voice Library (/voices)",
+                                choices=voice_library_choices,
+                                value=initial_voice_library_value,
+                                allow_custom_value=False,
+                                scale=5,
+                            )
+                            voice_library_refresh_button = gr.Button("Refresh", scale=1, variant="secondary")
+                        with gr.Row():
+                            voice_library_apply_button = gr.Button(
+                                "Use Selected Voice In Main",
+                                variant="secondary",
+                                scale=2,
+                            )
+                            voice_library_preview_button = gr.Button(
+                                "Preview Selected",
+                                variant="secondary",
+                                scale=1,
+                            )
+                        voice_library_status = gr.Markdown(
+                            f"Using `{_ensure_voices_dir()}` for voice files."
+                        )
+                        voice_library_inspector_status = gr.Markdown(initial_voice_library_inspector_status)
+                        voice_library_inventory = gr.Markdown(value=_voice_library_inventory_markdown())
+                        voice_library_preview_audio = gr.Audio(
+                            label="Selected Voice Preview",
+                            value=initial_voice_library_preview_audio,
+                            type="filepath",
+                            interactive=False,
+                        )
+                        voice_library_selected_file = gr.File(
+                            label="Selected Voice File",
+                            value=initial_voice_library_selected_file,
+                            interactive=False,
+                        )
+                        voice_library_preview_text = gr.Textbox(
+                            label="Transcript / Preview Text",
+                            lines=5,
+                            value=initial_voice_library_preview_text,
+                            interactive=False,
+                        )
+                        voice_library_metadata_text = gr.Textbox(
+                            label="Voice Metadata (.voice.json)",
+                            lines=10,
+                            value=initial_voice_library_metadata_text,
+                            interactive=False,
+                            elem_classes=["mono-log"],
+                        )
+                        with gr.Accordion("Upload / Import Files To /voices", open=False):
+                            voice_library_upload_files = gr.File(
+                                label="Voice Files To Import",
+                                file_types=audio_types + [".txt", ".json"],
+                                file_count="multiple",
+                                type="filepath",
+                            )
+                            voice_library_upload_overwrite = gr.Checkbox(
+                                label="Overwrite existing filenames",
+                                value=False,
+                            )
+                            voice_library_upload_button = gr.Button(
+                                "Import Files To /voices",
+                                variant="primary",
+                            )
+                            voice_library_upload_status = gr.Markdown("### Voice Import\n\nReady")
+
+                    with gr.Column(scale=1):
+                        gr.Markdown(
+                            "### Voice Generator\n\n"
+                            "Preview and save a synthetic voice generated from a text description using MOSS VoiceGenerator. "
+                            "Saved voices go to `/voices` as `.wav + .txt + .voice.json`."
+                        )
+                        voice_lab_status = gr.Markdown("### Voice Lab Ready")
+                        with gr.Row():
+                            voice_lab_name = gr.Textbox(
+                                label="Voice Name",
+                                placeholder="e.g. warm_narrator_v1",
+                                value="voice_lab_preview",
+                            )
+                            voice_lab_overwrite = gr.Checkbox(
+                                label="Overwrite existing files",
+                                value=True,
+                            )
+                        voice_lab_description = gr.Textbox(
+                            label="Voice Description",
+                            lines=4,
+                            placeholder=(
+                                "Describe the voice style (tone, age, accent, pacing, texture, emotion). "
+                                "Example: Calm middle-aged male narrator, warm tone, measured pacing, slight breathiness."
+                            ),
+                        )
+                        voice_lab_preview_text = gr.Textbox(
+                            label="Preview Text",
+                            lines=4,
+                            value=(
+                                "This is a voice preview generated from a text description. "
+                                "If the tone sounds right, save it and reuse it from the voices folder."
+                            ),
+                        )
+                        with gr.Accordion("Voice Lab Advanced", open=False):
+                            voice_lab_model_id = gr.Textbox(
+                                label="VoiceGenerator Model ID",
+                                value=DEFAULT_VOICEGEN_MODEL_ID,
+                            )
+                            with gr.Row():
+                                voice_lab_device = gr.Textbox(label="Device", value="cuda:0")
+                                voice_lab_dtype = gr.Dropdown(
+                                    label="DType",
+                                    choices=["float16", "bfloat16", "float32"],
+                                    value=DEFAULT_DTYPE,
+                                )
+                                voice_lab_attn = gr.Dropdown(
+                                    label="Attention",
+                                    choices=["sdpa", "flash_attention_2", "eager"],
+                                    value=DEFAULT_ATTN_IMPLEMENTATION,
+                                )
+                            voice_lab_max_new_tokens = gr.Slider(
+                                label="Max new tokens",
+                                minimum=256,
+                                maximum=8192,
+                                step=64,
+                                value=2048,
+                            )
+                        with gr.Row():
+                            voice_lab_generate_button = gr.Button(
+                                "Generate Preview + Save Voice",
+                                variant="primary",
+                            )
+                            voice_lab_refresh_button = gr.Button(
+                                "Refresh /voices",
+                                variant="secondary",
+                            )
+                        voice_lab_preview_audio = gr.Audio(
+                            label="Voice Preview Audio",
+                            type="filepath",
+                            interactive=False,
+                        )
+                        voice_lab_saved_file = gr.File(
+                            label="Saved Voice Preset (.voice.json)",
+                            interactive=False,
+                        )
+                        voice_lab_log = gr.Textbox(
+                            label="Voice Lab Log",
+                            lines=10,
+                            elem_classes=["mono-log"],
+                        )
+
+            with gr.Tab("4. Pre / Post-Processing Tools"):
+                gr.Markdown(
+                    "Workspace for pre-processing inputs and post-processing outputs. "
+                    "This tab is intentionally separated so utilities do not crowd the main generation page."
+                )
+                with gr.Accordion("Pre-Processing (Reference Audio / Text)", open=True):
+                    gr.Markdown(
+                        "- Reference audio trimming / cleanup (planned UI wrapper)\n"
+                        "- Transcript normalization and punctuation cleanup (planned)\n"
+                        "- Batch file staging and naming helpers (planned)"
+                    )
+                    gr.Textbox(
+                        label="Tool Notes / Scratchpad",
+                        lines=8,
+                        placeholder="Use this area to collect ffmpeg commands, preprocessing notes, or pipeline steps.",
+                    )
+                with gr.Accordion("Post-Processing (Output Audio)", open=False):
+                    gr.Markdown(
+                        "- Loudness normalization\n"
+                        "- Silence trim / fade helpers\n"
+                        "- Split/merge chapters\n"
+                        "- Alternate encode/export presets"
+                    )
+                    gr.Textbox(
+                        label="Post-Processing Queue Ideas",
+                        lines=8,
+                        placeholder="List post-processing steps you want to automate next.",
+                    )
+
+            with gr.Tab("5. Text Editing + Chapter Generation"):
+                gr.Markdown(
+                    "Book text workspace plus chapter tooling. Edit text here, then generate chapter markers and push the result "
+                    "back into the main book text used for generation."
+                )
+                with gr.Row(elem_classes=["app-shell"]):
+                    with gr.Column(scale=2):
+                        text_input = gr.Textbox(
+                            label="Book Text (optional)",
+                            placeholder="Paste text here, or upload a .txt file below.",
+                            lines=12,
+                        )
+                        text_file = gr.File(
+                            label="Book Text File (.txt)",
+                            file_types=[".txt"],
+                            type="filepath",
+                        )
+                    with gr.Column(scale=1):
+                        gr.Markdown(
+                            "### Workflow\n\n"
+                            "1. Paste/upload text here.\n"
+                            "2. Load into Chapter Assist working text.\n"
+                            "3. Preview regex matches and chunking.\n"
+                            "4. Insert `[CHAPTER]` markers.\n"
+                            "5. Apply back to the Book Text field."
+                        )
+
+                gr.Markdown(
+                    "### Chapter Assist\n\n"
+                    "Regex-assisted chapter tagging and chunk preview. Build a pattern, preview matches, insert `[CHAPTER]` "
+                    "markers, then push the text back into the main Book Text box."
                 )
                 chapter_assist_status = gr.Markdown("### Chapter Assist Ready")
                 chapter_assist_text = gr.Textbox(
@@ -2088,12 +2593,32 @@ def build_demo() -> gr.Blocks:
         )
 
         voice_library_refresh_button.click(
-            fn=refresh_voice_library_dropdown,
-            outputs=[voice_library_dropdown, voice_library_status],
+            fn=refresh_voice_library_workspace,
+            inputs=[voice_library_dropdown],
+            outputs=[
+                voice_library_dropdown,
+                voice_library_status,
+                voice_library_inventory,
+                voice_library_preview_audio,
+                voice_library_preview_text,
+                voice_library_selected_file,
+                voice_library_metadata_text,
+                voice_library_inspector_status,
+            ],
         )
         voice_lab_refresh_button.click(
-            fn=refresh_voice_library_dropdown,
-            outputs=[voice_library_dropdown, voice_library_status],
+            fn=refresh_voice_library_workspace,
+            inputs=[voice_library_dropdown],
+            outputs=[
+                voice_library_dropdown,
+                voice_library_status,
+                voice_library_inventory,
+                voice_library_preview_audio,
+                voice_library_preview_text,
+                voice_library_selected_file,
+                voice_library_metadata_text,
+                voice_library_inspector_status,
+            ],
         )
         voice_library_apply_button.click(
             fn=apply_voice_library_selection,
@@ -2110,6 +2635,11 @@ def build_demo() -> gr.Blocks:
                 voice_lab_name,
                 voice_lab_description,
                 voice_library_status,
+                voice_library_preview_audio,
+                voice_library_preview_text,
+                voice_library_selected_file,
+                voice_library_metadata_text,
+                voice_library_inspector_status,
             ],
         )
         voice_library_dropdown.change(
@@ -2127,6 +2657,42 @@ def build_demo() -> gr.Blocks:
                 voice_lab_name,
                 voice_lab_description,
                 voice_library_status,
+                voice_library_preview_audio,
+                voice_library_preview_text,
+                voice_library_selected_file,
+                voice_library_metadata_text,
+                voice_library_inspector_status,
+            ],
+        )
+        voice_library_preview_button.click(
+            fn=inspect_voice_library_selection_for_preview,
+            inputs=[voice_library_dropdown],
+            outputs=[
+                voice_library_preview_audio,
+                voice_library_preview_text,
+                voice_library_selected_file,
+                voice_library_metadata_text,
+                voice_library_inspector_status,
+            ],
+        )
+        voice_library_upload_button.click(
+            fn=import_voice_library_files,
+            inputs=[
+                voice_library_upload_files,
+                voice_library_upload_overwrite,
+                voice_library_dropdown,
+            ],
+            outputs=[
+                voice_library_upload_status,
+                voice_library_dropdown,
+                voice_library_status,
+                voice_library_inventory,
+                voice_library_preview_audio,
+                voice_library_preview_text,
+                voice_library_selected_file,
+                voice_library_metadata_text,
+                voice_library_inspector_status,
+                voice_library_upload_files,
             ],
         )
         voice_lab_generate_button.click(
