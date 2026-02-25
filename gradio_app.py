@@ -49,7 +49,6 @@ APP_ROOT = Path(__file__).resolve().parent
 CLI_SCRIPT = APP_ROOT / "audiobook_qwen3.py"
 DEFAULT_RUN_ROOT = APP_ROOT / "runs"
 VOICES_DIR = APP_ROOT / "voices"
-TEXTS_DIR = APP_ROOT / "text"
 DEFAULT_VOICEGEN_MODEL_ID = "OpenMOSS-Team/MOSS-VoiceGenerator"
 MAX_LOG_LINES = 500
 PROGRESS_LINE_RE = re.compile(
@@ -789,54 +788,6 @@ def _render_telemetry_panel(
 def _ensure_voices_dir() -> Path:
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
     return VOICES_DIR
-
-
-def _ensure_texts_dir() -> Path:
-    TEXTS_DIR.mkdir(parents=True, exist_ok=True)
-    return TEXTS_DIR
-
-
-def _text_dropdown_choices() -> list[tuple[str, str]]:
-    texts_dir = _ensure_texts_dir()
-    choices: list[tuple[str, str]] = []
-    for path in sorted(texts_dir.iterdir(), key=lambda item: item.name.lower()):
-        if path.is_file() and path.suffix.lower() in {".txt", ".epub"}:
-            choices.append((path.name, str(path.resolve())))
-    return choices
-
-
-def _extract_defrag_view(log_text: str) -> str:
-    if not log_text.strip():
-        return "No defrag activity yet."
-    interesting: list[str] = []
-    for raw in log_text.splitlines():
-        line = raw.strip()
-        lower = line.lower()
-        if "defrag" in lower or "fragment" in lower or "batch" in lower or "chapter" in lower:
-            interesting.append(line)
-    if not interesting:
-        return "No defrag/fragmentation lines detected yet."
-    return "\n".join(interesting[-80:])
-
-
-def _quick_start_readiness_status(
-    text_file_choice: str | None,
-    voice_choice: str | None,
-    model_id: str,
-    max_chars_per_batch: int,
-) -> str:
-    checks = [
-        ("Text", bool(text_file_choice)),
-        ("Voice", bool(voice_choice)),
-        ("Params", int(max_chars_per_batch) > 0),
-        ("Model", bool(str(model_id or "").strip())),
-    ]
-    blocks = []
-    for label, ready in checks:
-        state = "ready" if ready else "missing"
-        icon = "✅" if ready else "⬜"
-        blocks.append(f"<span class='readiness-pill {state}'>{icon} {html.escape(label)}</span>")
-    return "".join(blocks)
 
 
 def _safe_voice_stem(name: str) -> str:
@@ -1891,9 +1842,7 @@ def _step3_gate_visibility_updates(
 def run_generation(
     text_input: str,
     text_file: str | None,
-    text_library_path: str,
     reference_audio_file: str | None,
-    selected_voice_path: str,
     reference_audio_path: str,
     reference_text: str,
     reference_text_file: str | None,
@@ -1978,27 +1927,17 @@ def run_generation(
             _write_text_input(text_input, text_path)
         elif text_file:
             text_path = _stage_file(text_file, staging_dir, "book_text")
-        elif str(text_library_path or "").strip():
-            selected_text = Path(str(text_library_path).strip()).expanduser()
-            text_path = _stage_file(str(selected_text), staging_dir, "book_text")
 
         reference_audio_value: str | None = None
-        selected_voice = str(selected_voice_path or "").strip()
         if reference_audio_file:
             staged_audio = _stage_file(reference_audio_file, staging_dir, "reference_audio")
             reference_audio_value = str(staged_audio) if staged_audio else None
-        elif selected_voice:
-            reference_audio_value = selected_voice
         elif reference_audio_path.strip():
             reference_audio_value = reference_audio_path.strip()
 
         reference_text_file_path = _stage_file(
             reference_text_file, staging_dir, "reference_text"
         )
-        if not reference_text_file_path and reference_audio_value:
-            maybe_sidecar = Path(reference_audio_value).with_suffix(".txt")
-            if maybe_sidecar.exists() and maybe_sidecar.is_file():
-                reference_text_file_path = _stage_file(str(maybe_sidecar), staging_dir, "reference_text_auto")
 
         if not resume_state_path and not text_path:
             message = "Provide book text (paste text or upload a .txt/.epub file), or upload a resume state."
@@ -2009,7 +1948,7 @@ def run_generation(
             yield _build_status_message("Missing reference audio", message), None, None, message, telemetry_html(), progress_strip_html()
             return
         if (
-            reference_audio_value
+            reference_audio_file
             and not resume_state_path
             and not x_vector_only_mode
             and not reference_text.strip()
@@ -2329,18 +2268,8 @@ def build_demo() -> gr.Blocks:
         text-overflow: ellipsis;
     }
     .telemetry-metric.opacity-70 { opacity: 0.7; }
-    .header-shell {display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom: 10px;}
-    .header-actions {display:flex; align-items:center; gap:10px;}
-    .readiness-strip {display:flex; flex-wrap:wrap; gap:8px;}
-    .readiness-pill {display:inline-flex; align-items:center; padding:4px 10px; border-radius:999px; border:1px solid #d1d5db; font-size:12px; background:#f8fafc; color:#334155;}
-    .readiness-pill.ready {background:#ecfeff; border-color:#bae6fd; color:#0c4a6e;}
-    .header-title h1 {margin:0; font-size:30px;}
-    .header-title p {margin:4px 0 0 0; color:#64748b;}
-    .persistent-monitor {margin-top: 16px; padding-top: 12px; border-top: 1px solid rgba(148, 163, 184, 0.4);}
-    
     """
     audio_types = sorted(REFERENCE_AUDIO_EXTENSIONS)
-    text_library_choices = _text_dropdown_choices()
     voice_library_choices = _voice_dropdown_choices()
     initial_voice_library_value = voice_library_choices[0][1] if voice_library_choices else None
     (
@@ -2365,20 +2294,13 @@ def build_demo() -> gr.Blocks:
 
     with gr.Blocks(
         title="MOSS/Qwen Audiobook Studio",
-        theme=gr.themes.Soft(primary_hue="orange", neutral_hue="slate"),
+        theme=gr.themes.Soft(primary_hue="sky", neutral_hue="slate"),
         css=css,
     ) as demo:
-        with gr.Row(elem_classes=["app-shell", "header-shell"]):
-            with gr.Column(scale=3, elem_classes=["header-title"]):
-                gr.HTML("<h1>TTS Audiobook generator</h1><p>Readiness checks, generation controls, and studio workflow tabs.</p>")
-                quick_start_checks = gr.HTML(
-                    value=_quick_start_readiness_status(None, initial_voice_library_value, DEFAULT_MODEL_ID, DEFAULT_MAX_CHARS),
-                    elem_classes=["readiness-strip"],
-                )
-            with gr.Column(scale=2):
-                with gr.Row(elem_classes=["header-actions"]):
-                    run_button = gr.Button("GENERATE", variant="primary", size="lg")
-                    abort_button = gr.Button("ABORT", variant="stop")
+        gr.Markdown(
+            "## MOSS/Qwen Audiobook Studio\n"
+            "Step-by-step audiobook workspace: prepare text, prepare/select voices, run generation, then monitor and post-process."
+        )
 
         progress_strip = gr.HTML(
             value=_render_compact_progress_strip(
@@ -2389,10 +2311,10 @@ def build_demo() -> gr.Blocks:
             elem_classes=["app-shell", "sticky-progress-wrap"],
         )
 
-        with gr.Tabs(selected="step3_generate", elem_classes=["app-shell"]) as workflow_tabs:
-            with gr.Tab("Book Editor:", id="step1_text"):
+        with gr.Tabs(selected="step1_text", elem_classes=["app-shell"]) as workflow_tabs:
+            with gr.Tab("Step 1. Text Editing + Chapter Generation", id="step1_text"):
                 gr.Markdown(
-                    "All editing features including regex cleaning, chapter editing, batch preview, and ebook import are managed here."
+                    "Start here: add or edit book text, preview chunking, and insert chapter markers before rendering."
                 )
                 with gr.Row(elem_classes=["app-shell"]):
                     with gr.Column(scale=2):
@@ -2478,7 +2400,7 @@ def build_demo() -> gr.Blocks:
                         variant="secondary",
                     )
 
-            with gr.Tab("Voice Lab:", id="step2_voice"):
+            with gr.Tab("Step 2. Voice Lab (Browse / Create / Upload)", id="step2_voice"):
                 gr.Markdown(
                     "Pick a voice for generation, preview existing voices, upload new voice assets into `/voices`, or create a synthetic voice preset."
                 )
@@ -2615,9 +2537,9 @@ def build_demo() -> gr.Blocks:
                     )
                     step2_open_monitor_button = gr.Button("Open Monitor", variant="secondary")
 
-            with gr.Tab("Quick Start:", id="step3_generate"):
+            with gr.Tab("Step 3. Main Book Generation", id="step3_generate"):
                 gr.Markdown(
-                    "Select text + voice + model + preset, then generate. Use Advanced for parameter-level control."
+                    "Run the audiobook render. Use Step 1 for text and Step 2 to prepare/select a voice before starting."
                 )
                 step3_gate_status = gr.Markdown(initial_step3_gate_status_md)
                 with gr.Column(
@@ -2637,41 +2559,29 @@ def build_demo() -> gr.Blocks:
                         step3_next_monitor_button = gr.Button("Next: Monitor", variant="secondary")
                     with gr.Row(elem_classes=["app-shell"]):
                         with gr.Column(scale=2):
-                            gr.Markdown("### Quick Start Inputs")
-                            text_library_dropdown = gr.Dropdown(
-                                label="Text from /text",
-                                choices=text_library_choices,
-                                value=text_library_choices[0][1] if text_library_choices else None,
-                            )
-                            voice_quick_dropdown = gr.Dropdown(
-                                label="Voice from /voices",
-                                choices=voice_library_choices,
-                                value=initial_voice_library_value,
-                            )
-                            quick_start_preset = gr.Dropdown(
-                                label="Preset",
-                                choices=["Fast", "Balanced", "Quality"],
-                                value="Balanced",
-                                info="Recommended defaults based on quality, content length, and GPU.",
-                            )
+                            gr.Markdown("### Reference Voice + Resume")
                             reference_audio_file = gr.File(
                                 label="Reference Audio File",
                                 file_types=audio_types,
                                 type="filepath",
-                                visible=False,
                             )
-                            reference_audio_path = gr.Textbox(label="Reference Audio Path", visible=False)
-                            reference_text = gr.Textbox(label="Reference Transcript", value="", visible=False)
+                            reference_audio_path = gr.Textbox(
+                                label="Reference Audio Path or URL (optional)",
+                                placeholder="Use this if you do not upload audio.",
+                            )
+                            reference_text = gr.Textbox(
+                                label="Reference Transcript (optional)",
+                                placeholder="Required unless X-Vector only mode is enabled.",
+                                lines=4,
+                            )
                             reference_text_file = gr.File(
                                 label="Reference Transcript File (.txt)",
                                 file_types=[".txt"],
                                 type="filepath",
-                                visible=False,
                             )
                             x_vector_only_mode = gr.Checkbox(
                                 label="X-Vector Only Mode (no transcript required)",
                                 value=False,
-                                visible=False,
                             )
                             resume_state_file = gr.File(
                                 label="Resume State (session_state.json, optional)",
@@ -2766,12 +2676,13 @@ def build_demo() -> gr.Blocks:
                                     precision=0,
                                 )
                     with gr.Row():
+                        run_button = gr.Button("Generate Audiobook", variant="primary", size="lg")
                         clear_button = gr.Button("Clear Output", variant="secondary")
-                    gr.Markdown("Detailed run telemetry and logs are shown in the persistent monitor below.")
+                    gr.Markdown("Detailed run telemetry and logs are available in the **Monitor** tab.")
 
-            with gr.Tab("Multi-Speaker:", id="step4_multi"):
+            with gr.Tab("Step 4. Multi-Speaker Generation", id="step4_multi"):
                 gr.Markdown(
-                    "All multi-speaker features live in this tab."
+                    "Workspace for future multi-speaker rendering. Keep script/dialogue prep here while the backend flow is added."
                 )
                 gr.Textbox(
                     label="Dialogue / Narration Script",
@@ -2797,9 +2708,9 @@ def build_demo() -> gr.Blocks:
                         "- Batch render queue"
                     )
 
-            with gr.Tab("Audio Lab:", id="step5_tools"):
+            with gr.Tab("Step 5. Pre / Post-Processing Tools", id="step5_tools"):
                 gr.Markdown(
-                    "Pre-process and post-process features are grouped here for input cleanup and output mastering."
+                    "Pre/post-processing workspace for reference prep and output finishing tools."
                 )
                 with gr.Accordion("Pre-Processing (Reference Audio / Text)", open=True):
                     gr.Markdown(
@@ -2825,47 +2736,40 @@ def build_demo() -> gr.Blocks:
                         placeholder="List post-processing steps you want to automate next.",
                     )
 
-            with gr.Tab("Settings:", id="settings"):
-                gr.Markdown("Toggle telemetry and runtime behaviors for this workstation.")
-                telemetry_enabled = gr.Checkbox(label="Enable telemetry widgets", value=True)
-                show_console_auto_scroll = gr.Checkbox(label="Auto-scroll console output", value=True)
-                gr.Markdown("Additional settings can be added here as runtime controls expand.")
-
-        with gr.Column(elem_classes=["app-shell", "persistent-monitor"]):
-            gr.Markdown("### Persistent Monitor")
-            status = gr.Markdown("### Ready")
-            with gr.Row():
-                with gr.Column(scale=3):
-                    telemetry = gr.HTML(
-                        value=_render_telemetry_panel(
-                            log_lines=[],
-                            command=None,
-                            job_root=None,
-                            run_root=DEFAULT_RUN_ROOT.resolve(),
-                            expected_output=None,
-                            device_hint="cuda:0",
-                            started_at=None,
-                            process_pid=None,
-                            cache={},
+            with gr.Tab("Monitor (Telemetry + Logs)", id="monitor"):
+                gr.Markdown(
+                    "Detailed run status, telemetry, outputs, and logs. The sticky progress bar at the top stays minimal while you work in other tabs."
+                )
+                status = gr.Markdown("### Ready")
+                with gr.Row(elem_classes=["app-shell"]):
+                    with gr.Column(scale=3):
+                        telemetry = gr.HTML(
+                            value=_render_telemetry_panel(
+                                log_lines=[],
+                                command=None,
+                                job_root=None,
+                                run_root=DEFAULT_RUN_ROOT.resolve(),
+                                expected_output=None,
+                                device_hint="cuda:0",
+                                started_at=None,
+                                process_pid=None,
+                                cache={},
+                            )
                         )
-                    )
-                with gr.Column(scale=2):
-                    defrag_viewer = gr.Textbox(label="Defrag Viewer", lines=18, value="No defrag activity yet.", elem_classes=["mono-log"])
-                    logs = gr.Textbox(label="Console Output", lines=18, elem_classes=["mono-log"])
-            with gr.Row():
-                with gr.Column(scale=2):
-                    audio_output = gr.Audio(label="Output Preview", type="filepath", interactive=False)
-                with gr.Column(scale=1):
-                    file_output = gr.File(label="Download Output", interactive=False)
+                    with gr.Column(scale=2):
+                        logs = gr.Textbox(label="Run Log", lines=18, elem_classes=["mono-log"])
+                with gr.Row(elem_classes=["app-shell"]):
+                    with gr.Column(scale=2):
+                        audio_output = gr.Audio(label="Output Preview", type="filepath", interactive=False)
+                    with gr.Column(scale=1):
+                        file_output = gr.File(label="Download Output", interactive=False)
 
-        run_event = run_button.click(
+        run_button.click(
             fn=run_generation,
             inputs=[
                 text_input,
                 text_file,
-                text_library_dropdown,
                 reference_audio_file,
-                voice_quick_dropdown,
                 reference_audio_path,
                 reference_text,
                 reference_text_file,
@@ -2891,11 +2795,6 @@ def build_demo() -> gr.Blocks:
                 stop_after_batch,
             ],
             outputs=[status, audio_output, file_output, logs, telemetry, progress_strip],
-        )
-        abort_button.click(
-            fn=lambda: "### Generation aborted",
-            outputs=[status],
-            cancels=[run_event],
         )
 
         clear_button.click(
@@ -2933,7 +2832,7 @@ def build_demo() -> gr.Blocks:
             outputs=[workflow_tabs],
         )
         step1_open_monitor_button.click(
-            fn=lambda: _select_workflow_tab("step3_generate"),
+            fn=lambda: _select_workflow_tab("monitor"),
             outputs=[workflow_tabs],
         )
         step2_back_to_step1_button.click(
@@ -2949,7 +2848,7 @@ def build_demo() -> gr.Blocks:
             outputs=[workflow_tabs],
         )
         step2_open_monitor_button.click(
-            fn=lambda: _select_workflow_tab("step3_generate"),
+            fn=lambda: _select_workflow_tab("monitor"),
             outputs=[workflow_tabs],
         )
         step3_go_step1_button.click(
@@ -2961,7 +2860,7 @@ def build_demo() -> gr.Blocks:
             outputs=[workflow_tabs],
         )
         step3_next_monitor_button.click(
-            fn=lambda: _select_workflow_tab("step3_generate"),
+            fn=lambda: _select_workflow_tab("monitor"),
             outputs=[workflow_tabs],
         )
 
@@ -2984,32 +2883,6 @@ def build_demo() -> gr.Blocks:
             fn=_step3_gate_visibility_updates,
             inputs=[text_input, text_file],
             outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
-        )
-
-        logs.change(
-            fn=_extract_defrag_view,
-            inputs=[logs],
-            outputs=[defrag_viewer],
-        )
-        text_library_dropdown.change(
-            fn=_quick_start_readiness_status,
-            inputs=[text_library_dropdown, voice_quick_dropdown, model_id, max_chars_per_batch],
-            outputs=[quick_start_checks],
-        )
-        voice_quick_dropdown.change(
-            fn=_quick_start_readiness_status,
-            inputs=[text_library_dropdown, voice_quick_dropdown, model_id, max_chars_per_batch],
-            outputs=[quick_start_checks],
-        )
-        model_id.change(
-            fn=_quick_start_readiness_status,
-            inputs=[text_library_dropdown, voice_quick_dropdown, model_id, max_chars_per_batch],
-            outputs=[quick_start_checks],
-        )
-        max_chars_per_batch.change(
-            fn=_quick_start_readiness_status,
-            inputs=[text_library_dropdown, voice_quick_dropdown, model_id, max_chars_per_batch],
-            outputs=[quick_start_checks],
         )
 
         voice_library_refresh_button.click(
