@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +50,7 @@ APP_ROOT = Path(__file__).resolve().parent
 CLI_SCRIPT = APP_ROOT / "audiobook_qwen3.py"
 DEFAULT_RUN_ROOT = APP_ROOT / "runs"
 VOICES_DIR = APP_ROOT / "voices"
+TEXT_LIBRARY_DIR = APP_ROOT / "text"
 DEFAULT_VOICEGEN_MODEL_ID = "OpenMOSS-Team/MOSS-VoiceGenerator"
 MAX_LOG_LINES = 500
 PROGRESS_LINE_RE = re.compile(
@@ -57,6 +59,9 @@ PROGRESS_LINE_RE = re.compile(
 )
 STATUS_LINE_RE = re.compile(r"^status:\s*(.+)$", re.IGNORECASE)
 VOICE_METADATA_SUFFIX = ".voice.json"
+_ACTIVE_RUN_LOCK = threading.Lock()
+_ACTIVE_RUN_PROCESS: subprocess.Popen[str] | None = None
+_ACTIVE_RUN_ABORT_REQUESTED = False
 
 
 def _sanitize_output_name(name: str) -> str:
@@ -138,7 +143,11 @@ def _load_book_file_into_editor(book_file_path: str | None) -> tuple[Any, str]:
 
     detail = (
         f"Loaded `{source.name}` into the editor."
-        + (" EPUB cleanup removed common notes/media markup and normalized headings." if source.suffix.lower() == ".epub" else "")
+        + (
+            " EPUB cleanup removed common notes/media markup, normalized headings, and inserted `[CHAPTER]` markers from ebook chapter headings."
+            if source.suffix.lower() == ".epub"
+            else ""
+        )
     )
     return normalized, _build_status_message("Book Import", detail)
 
@@ -394,12 +403,12 @@ def _metric_bar(
     )
 
 
-def _render_compact_progress_strip(
+def _progress_view_model(
     *,
     log_lines: list[str],
     started_at: float | None,
     expected_output: Path | None,
-) -> str:
+) -> dict[str, Any]:
     progress = _extract_latest_progress(log_lines)
     phase = _extract_latest_status(log_lines)
     elapsed = max(0.0, time.time() - started_at) if started_at is not None else 0.0
@@ -412,11 +421,12 @@ def _render_compact_progress_strip(
 
     pct = 0.0
     progress_text = "idle"
+    eta_text = "n/a"
     if progress:
-        batch_done = int(progress.get("batch_done", 0) or 0)
-        batch_total = int(progress.get("batch_total", 0) or 0)
-        char_done = int(progress.get("char_done", 0) or 0)
-        char_total = int(progress.get("char_total", 0) or 0)
+        batch_done = int(progress.get("completed_batches", 0) or 0)
+        batch_total = int(progress.get("total_batches", 0) or 0)
+        char_done = int(progress.get("completed_chars", 0) or 0)
+        char_total = int(progress.get("total_chars", 0) or 0)
         if char_total > 0:
             pct = (char_done / char_total) * 100.0
         elif batch_total > 0:
@@ -424,9 +434,11 @@ def _render_compact_progress_strip(
         progress_text = f"batches {batch_done}/{batch_total}" if batch_total else f"chars {char_done}/{char_total}"
         if batch_total and char_total:
             progress_text = f"batches {batch_done}/{batch_total} | chars {char_done}/{char_total}"
+        eta_text = str(progress.get("eta_text", "n/a") or "n/a")
     elif output_path and output_path.exists():
         pct = 100.0
         progress_text = "complete"
+        eta_text = "0:00"
     elif log_lines:
         pct = 5.0 if started_at is not None else 0.0
         progress_text = f"{len(log_lines)} log lines"
@@ -441,19 +453,160 @@ def _render_compact_progress_strip(
     color = "#ef4444" if is_error else ("#22c55e" if pct >= 100.0 else "#38bdf8")
     elapsed_text = f"{elapsed:.1f}s" if started_at is not None or log_lines else "0.0s"
     out_text = output_path.name if output_path and output_path.exists() else "n/a"
+    return {
+        "pct": pct,
+        "phase_text": phase_text,
+        "progress_text": progress_text,
+        "eta_text": eta_text,
+        "elapsed_text": elapsed_text,
+        "out_text": out_text,
+        "color": color,
+        "is_error": is_error,
+    }
+
+
+def _render_compact_progress_strip(
+    *,
+    log_lines: list[str],
+    started_at: float | None,
+    expected_output: Path | None,
+) -> str:
+    view = _progress_view_model(
+        log_lines=log_lines,
+        started_at=started_at,
+        expected_output=expected_output,
+    )
 
     return (
         "<div class='sticky-progress-shell'>"
         "<div class='sticky-progress-top'>"
-        f"<span class='sticky-progress-phase'>{html.escape(phase_text)}</span>"
-        f"<span class='sticky-progress-stat'>{html.escape(progress_text)}</span>"
-        f"<span class='sticky-progress-stat'>elapsed {html.escape(elapsed_text)}</span>"
-        f"<span class='sticky-progress-stat'>output {html.escape(out_text)}</span>"
+        f"<span class='sticky-progress-phase'>{html.escape(str(view['phase_text']))}</span>"
+        f"<span class='sticky-progress-stat'>{html.escape(str(view['progress_text']))}</span>"
+        f"<span class='sticky-progress-stat'>eta {html.escape(str(view['eta_text']))}</span>"
+        f"<span class='sticky-progress-stat'>elapsed {html.escape(str(view['elapsed_text']))}</span>"
+        f"<span class='sticky-progress-stat'>output {html.escape(str(view['out_text']))}</span>"
         "</div>"
         "<div class='sticky-progress-bar'>"
-        f"<div class='sticky-progress-fill' style='width:{pct:.1f}%; background:{color};'></div>"
+        f"<div class='sticky-progress-fill' style='width:{float(view['pct']):.1f}%; background:{html.escape(str(view['color']))};'></div>"
         "</div>"
         "</div>"
+    )
+
+
+def _render_header_progress_panel(
+    *,
+    log_lines: list[str],
+    started_at: float | None,
+    expected_output: Path | None,
+) -> str:
+    view = _progress_view_model(
+        log_lines=log_lines,
+        started_at=started_at,
+        expected_output=expected_output,
+    )
+    pct = float(view["pct"])
+    return (
+        "<div class='header-run-progress'>"
+        f"<div class='header-run-top'><span class='header-run-phase'>{html.escape(str(view['phase_text']))}</span>"
+        f"<span class='header-run-pct'>{pct:.1f}%</span>"
+        f"<span class='header-run-eta'>eta {html.escape(str(view['eta_text']))}</span></div>"
+        "<div class='header-run-bar'>"
+        f"<div class='header-run-fill' style='width:{pct:.1f}%; background:{html.escape(str(view['color']))};'></div>"
+        "</div>"
+        "</div>"
+    )
+
+
+def _run_button_update(
+    *,
+    log_lines: list[str],
+    started_at: float | None,
+    expected_output: Path | None,
+    is_running: bool,
+    is_stopping: bool = False,
+) -> dict[str, Any]:
+    if is_stopping:
+        return gr.update(value="STOPPING...", interactive=False, variant="stop")
+    if not is_running:
+        return gr.update(value="GENERATE", interactive=True, variant="primary")
+    view = _progress_view_model(
+        log_lines=log_lines,
+        started_at=started_at,
+        expected_output=expected_output,
+    )
+    return gr.update(
+        value=f"RUNNING {float(view['pct']):.1f}% | ETA {view['eta_text']}",
+        interactive=False,
+        variant="secondary",
+    )
+
+
+def _reset_header_progress_panel() -> str:
+    return _render_header_progress_panel(log_lines=[], started_at=None, expected_output=None)
+
+
+def _register_active_run_process(process: subprocess.Popen[str]) -> None:
+    global _ACTIVE_RUN_PROCESS, _ACTIVE_RUN_ABORT_REQUESTED
+    with _ACTIVE_RUN_LOCK:
+        _ACTIVE_RUN_PROCESS = process
+        _ACTIVE_RUN_ABORT_REQUESTED = False
+
+
+def _clear_active_run_process(process: subprocess.Popen[str] | None = None) -> bool:
+    global _ACTIVE_RUN_PROCESS, _ACTIVE_RUN_ABORT_REQUESTED
+    with _ACTIVE_RUN_LOCK:
+        aborted = bool(_ACTIVE_RUN_ABORT_REQUESTED)
+        if process is None or _ACTIVE_RUN_PROCESS is process:
+            _ACTIVE_RUN_PROCESS = None
+            _ACTIVE_RUN_ABORT_REQUESTED = False
+        return aborted
+
+
+def _is_run_process_active() -> bool:
+    with _ACTIVE_RUN_LOCK:
+        proc = _ACTIVE_RUN_PROCESS
+        if proc is None:
+            return False
+        try:
+            return proc.poll() is None
+        except Exception:
+            return False
+
+
+def _request_abort_active_run() -> tuple[bool, str]:
+    global _ACTIVE_RUN_ABORT_REQUESTED
+    with _ACTIVE_RUN_LOCK:
+        proc = _ACTIVE_RUN_PROCESS
+        if proc is None:
+            return False, "No active generation process."
+        try:
+            if proc.poll() is not None:
+                return False, "Generation is not currently running."
+        except Exception:
+            return False, "Generation process is unavailable."
+        _ACTIVE_RUN_ABORT_REQUESTED = True
+
+    try:
+        proc.terminate()
+        return True, "Abort requested. Waiting for the backend process to exit..."
+    except Exception as exc:
+        return False, f"Abort request failed: {exc}"
+
+
+def abort_generation() -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+    ok, message = _request_abort_active_run()
+    title = "Abort Requested" if ok else "Abort"
+    return (
+        _build_status_message(title, message),
+        _build_status_message(title, message),
+        _run_button_update(
+            log_lines=[],
+            started_at=None,
+            expected_output=None,
+            is_running=True,
+            is_stopping=ok,
+        ),
+        gr.update(interactive=False),
     )
 
 
@@ -790,6 +943,90 @@ def _ensure_voices_dir() -> Path:
     return VOICES_DIR
 
 
+def _ensure_text_library_dir() -> Path:
+    TEXT_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    return TEXT_LIBRARY_DIR
+
+
+def _scan_text_library_files() -> list[Path]:
+    text_dir = _ensure_text_library_dir()
+    files: list[Path] = []
+    for path in sorted(text_dir.rglob("*"), key=lambda p: str(p).lower()):
+        if not path.is_file():
+            continue
+        if any(part.startswith(".") for part in path.parts):
+            continue
+        if path.suffix.lower() not in {".txt", ".epub"}:
+            continue
+        files.append(path)
+    return files
+
+
+def _text_library_dropdown_choices() -> list[tuple[str, str]]:
+    text_dir = _ensure_text_library_dir()
+    choices: list[tuple[str, str]] = []
+    for path in _scan_text_library_files():
+        try:
+            rel = path.relative_to(text_dir)
+            label = str(rel).replace("\\", "/")
+        except Exception:
+            label = path.name
+        choices.append((label, str(path.resolve())))
+    return choices
+
+
+def refresh_text_library_dropdown(
+    selected_value: str | None,
+) -> tuple[dict[str, Any], str]:
+    choices = _text_library_dropdown_choices()
+    valid_values = {value for _label, value in choices}
+    selected = selected_value if selected_value in valid_values else None
+    if selected is None and choices:
+        selected = choices[0][1]
+    text_dir = _ensure_text_library_dir()
+    summary = (
+        f"Text library ready: {len(choices)} file(s) in `{text_dir}`."
+        if choices
+        else f"No `.txt`/`.epub` files found in `{text_dir}` yet."
+    )
+    return gr.update(choices=choices, value=selected), summary
+
+
+def save_book_editor_text_to_library(
+    filename: str,
+    text_value: str,
+    current_selected_value: str | None,
+) -> tuple[str, dict[str, Any], str, str]:
+    text_dir = _ensure_text_library_dir()
+    normalized = str(text_value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        dropdown_update, summary = refresh_text_library_dropdown(current_selected_value)
+        return (
+            _build_status_message("Book Save", "Book Editor text is empty. Nothing was saved."),
+            dropdown_update,
+            summary,
+            str(filename or "").strip(),
+        )
+
+    raw_name = str(filename or "").strip() or "book_editor_export.txt"
+    safe_name = re.sub(r"[\\/:*?\"<>|]+", "_", raw_name)
+    if not safe_name.lower().endswith(".txt"):
+        safe_name = f"{safe_name}.txt"
+    target = (text_dir / safe_name).resolve()
+    if not str(target).lower().startswith(str(text_dir.resolve()).lower()):
+        target = (text_dir / Path(safe_name).name).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(normalized + "\n", encoding="utf-8", newline="\n")
+
+    dropdown_update, summary = refresh_text_library_dropdown(str(target))
+    return (
+        _build_status_message("Book Save", f"Saved Book Editor text to `{target.name}` in `/text`."),
+        dropdown_update,
+        summary,
+        target.name,
+    )
+
+
 def _safe_voice_stem(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or "").strip()).strip("._")
     return cleaned or datetime.now().strftime("voice_%Y%m%d_%H%M%S")
@@ -853,6 +1090,21 @@ def refresh_voice_library_dropdown() -> tuple[dict[str, Any], str]:
         else f"No voice files found yet in `{voices_dir}`."
     )
     return gr.update(choices=choices, value=None), summary
+
+
+def refresh_quick_voice_selector(selected_value: str | None) -> tuple[dict[str, Any], str]:
+    choices = _voice_dropdown_choices()
+    valid_values = {value for _label, value in choices}
+    selected = selected_value if selected_value in valid_values else None
+    if selected is None and choices:
+        selected = choices[0][1]
+    voices_dir = _ensure_voices_dir()
+    summary = (
+        f"Voice selector refreshed: {len(choices)} item(s) in `{voices_dir}`."
+        if choices
+        else f"No voice files found yet in `{voices_dir}`."
+    )
+    return gr.update(choices=choices, value=selected), summary
 
 
 def _voice_library_inventory_markdown() -> str:
@@ -1275,6 +1527,41 @@ def apply_voice_library_selection(
         preview_file,
         metadata_text,
         inspector_status,
+    )
+
+
+def apply_quickstart_voice_selection(
+    selected_value: str | None,
+    current_reference_audio_path: str,
+    current_reference_text: str,
+    current_voice_lab_name: str,
+    current_voice_lab_description: str,
+) -> tuple[str, str, str, str, str, dict[str, Any]]:
+    (
+        ref_audio,
+        ref_text,
+        voice_name,
+        voice_description,
+        status_message,
+        _preview_audio,
+        _preview_text,
+        _preview_file,
+        _metadata_text,
+        _inspector_status,
+    ) = apply_voice_library_selection(
+        selected_value,
+        current_reference_audio_path,
+        current_reference_text,
+        current_voice_lab_name,
+        current_voice_lab_description,
+    )
+    return (
+        ref_audio,
+        ref_text,
+        voice_name,
+        voice_description,
+        status_message,
+        gr.update(value=selected_value),
     )
 
 
@@ -1839,6 +2126,130 @@ def _step3_gate_visibility_updates(
     )
 
 
+def _readiness_badge(label: str, ready: bool, detail: str) -> str:
+    state_class = "ready" if ready else "missing"
+    symbol = "OK" if ready else "WAIT"
+    return (
+        f"<div class='readiness-pill {state_class}'>"
+        f"<span class='readiness-label'>{html.escape(label)}</span>"
+        f"<span class='readiness-symbol'>{html.escape(symbol)}</span>"
+        f"<span class='readiness-detail'>{html.escape(detail)}</span>"
+        "</div>"
+    )
+
+
+def render_generation_readiness_header(
+    text_value: str,
+    text_file_value: str | None,
+    reference_audio_file: str | None,
+    reference_audio_path: str,
+    reference_text: str,
+    reference_text_file: str | None,
+    x_vector_only_mode: bool,
+    resume_state_file: str | None,
+    output_name: str,
+    model_id: str,
+    device: str,
+    tts_backend: str,
+    max_chars_per_batch: int,
+    pause_ms: int,
+    chapter_pause_ms: int,
+) -> str:
+    has_text = bool(str(text_value or "").strip() or str(text_file_value or "").strip())
+    has_resume = bool(str(resume_state_file or "").strip())
+    has_voice = bool(str(reference_audio_file or "").strip() or str(reference_audio_path or "").strip())
+    has_transcript = bool(str(reference_text or "").strip() or str(reference_text_file or "").strip())
+    transcript_ready = bool(x_vector_only_mode or has_transcript or has_resume)
+    voice_ready = bool(has_voice or has_resume)
+    text_ready = bool(has_text or has_resume)
+    model_ready = bool(str(model_id or "").strip()) and bool(str(device or "").strip()) and bool(str(tts_backend or "").strip())
+    params_ready = int(max_chars_per_batch) > 0 and int(pause_ms) >= 0 and int(chapter_pause_ms) >= 0
+    output_ready = bool(str(output_name or "").strip())
+
+    checks = [
+        _readiness_badge("Text", text_ready, "loaded" if text_ready else "load / paste / select from /text"),
+        _readiness_badge("Voice", voice_ready, "reference ready" if voice_ready else "pick from /voices"),
+        _readiness_badge(
+            "Transcript",
+            transcript_ready,
+            "sidecar/x-vector/resume ok" if transcript_ready else "voice transcript missing",
+        ),
+        _readiness_badge("Model", model_ready, "model/backend/device set" if model_ready else "set model/backend/device"),
+        _readiness_badge("Params", params_ready, "runtime values set" if params_ready else "check advanced params"),
+        _readiness_badge("Output", output_ready, "filename set" if output_ready else "set output filename"),
+    ]
+    overall_ready = all([text_ready, voice_ready, transcript_ready, model_ready, params_ready, output_ready])
+    overall_label = "READY TO GENERATE" if overall_ready else "SETUP INCOMPLETE"
+    overall_class = "ready" if overall_ready else "missing"
+    return (
+        "<div class='readiness-shell'>"
+        f"<div class='readiness-summary {overall_class}'>{html.escape(overall_label)}</div>"
+        "<div class='readiness-grid'>"
+        + "".join(checks)
+        + "</div></div>"
+    )
+
+
+def apply_quickstart_preset(preset_name: str) -> tuple[int, int, int, int, int, bool, str]:
+    preset_key = str(preset_name or "").strip().lower()
+    max_chars = DEFAULT_MAX_CHARS
+    pause_value = DEFAULT_PAUSE_MS
+    chapter_pause_value = DEFAULT_CHAPTER_PAUSE_MS
+    mp3_q = 0
+    batch_size = 0
+    continuation_value = False
+    note = "Balanced preset applied."
+
+    if "long" in preset_key and "quality" in preset_key:
+        max_chars = 900
+        pause_value = 250
+        chapter_pause_value = max(DEFAULT_CHAPTER_PAUSE_MS, 900)
+        mp3_q = 0
+        batch_size = 0
+        continuation_value = True
+        note = "Long Book + Quality preset: safer chunking and continuation chain for consistency."
+    elif "fast" in preset_key or "draft" in preset_key or "low vram" in preset_key:
+        max_chars = 1400
+        pause_value = 120
+        chapter_pause_value = 500
+        mp3_q = 3
+        batch_size = 1
+        continuation_value = False
+        note = "Fast Draft / Low VRAM preset: larger chunks and conservative batch size for quicker iteration."
+    elif "continuity" in preset_key:
+        max_chars = 800
+        pause_value = 300
+        chapter_pause_value = max(DEFAULT_CHAPTER_PAUSE_MS, 1100)
+        mp3_q = 0
+        batch_size = 0
+        continuation_value = True
+        note = "Highest Continuity preset: slowest, best for long-form narration consistency."
+    else:
+        note = "Balanced preset: good starting point for most books on a single GPU."
+
+    return (
+        int(max_chars),
+        int(pause_value),
+        int(chapter_pause_value),
+        int(mp3_q),
+        int(batch_size),
+        bool(continuation_value),
+        _build_status_message("Quick Start Preset", note),
+    )
+
+
+def apply_monitor_visibility_settings(
+    show_graphical_monitor: bool,
+    show_defrag_viewer: bool,
+    show_console_output: bool,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    return (
+        gr.update(visible=bool(show_graphical_monitor)),
+        gr.update(visible=bool(show_defrag_viewer)),
+        gr.update(visible=bool(show_console_output)),
+    )
+
+
 def run_generation(
     text_input: str,
     text_file: str | None,
@@ -1866,7 +2277,21 @@ def run_generation(
     continuation_chain: bool,
     continuation_anchor_seconds: float,
     stop_after_batch: int,
-) -> Generator[tuple[str, str | None, str | None, str, str, str], None, None]:
+) -> Generator[
+    tuple[
+        str,
+        str | None,
+        str | None,
+        str,
+        str,
+        str,
+        str,
+        dict[str, Any],
+        dict[str, Any],
+    ],
+    None,
+    None,
+]:
     log_lines: list[str] = []
     telemetry_cache: dict[str, object] = {}
     run_root_path: Path | None = None
@@ -1902,11 +2327,70 @@ def run_generation(
             expected_output=expected_output,
         )
 
-    yield _build_status_message("Preparing job..."), None, None, "", telemetry_html(), progress_strip_html()
+    def header_progress_html() -> str:
+        return _render_header_progress_panel(
+            log_lines=log_lines,
+            started_at=started,
+            expected_output=expected_output,
+        )
+
+    def running_button_update(*, stopping: bool = False) -> dict[str, Any]:
+        return _run_button_update(
+            log_lines=log_lines,
+            started_at=started,
+            expected_output=expected_output,
+            is_running=True,
+            is_stopping=stopping,
+        )
+
+    def idle_button_update() -> dict[str, Any]:
+        return _run_button_update(
+            log_lines=[],
+            started_at=None,
+            expected_output=None,
+            is_running=False,
+        )
+
+    if _is_run_process_active():
+        message = "Another generation is already running. Abort it before starting a new one."
+        yield (
+            _build_status_message("Unable to start", message),
+            None,
+            None,
+            message,
+            telemetry_html(),
+            progress_strip_html(),
+            header_progress_html(),
+            idle_button_update(),
+            gr.update(interactive=False),
+        )
+        return
+
+    yield (
+        _build_status_message("Preparing job..."),
+        None,
+        None,
+        "",
+        telemetry_html(),
+        progress_strip_html(),
+        header_progress_html(),
+        running_button_update(),
+        gr.update(interactive=False),
+    )
 
     if not CLI_SCRIPT.exists():
         message = f"CLI script not found: {CLI_SCRIPT}"
-        yield _build_status_message("Unable to start", message), None, None, message, telemetry_html(), progress_strip_html()
+        yield (
+            _build_status_message("Unable to start", message),
+            None,
+            None,
+            message,
+            telemetry_html(),
+            progress_strip_html(),
+            header_progress_html(),
+            idle_button_update(),
+            gr.update(interactive=False),
+        )
         return
 
     run_root_path = Path(run_root or str(DEFAULT_RUN_ROOT)).expanduser().resolve()
@@ -1941,11 +2425,31 @@ def run_generation(
 
         if not resume_state_path and not text_path:
             message = "Provide book text (paste text or upload a .txt/.epub file), or upload a resume state."
-            yield _build_status_message("Missing input", message), None, None, message, telemetry_html(), progress_strip_html()
+            yield (
+                _build_status_message("Missing input", message),
+                None,
+                None,
+                message,
+                telemetry_html(),
+                progress_strip_html(),
+                header_progress_html(),
+                idle_button_update(),
+                gr.update(interactive=False),
+            )
             return
         if not resume_state_path and not reference_audio_value:
             message = "Provide reference audio (upload file or path/URL) for a new run."
-            yield _build_status_message("Missing reference audio", message), None, None, message, telemetry_html(), progress_strip_html()
+            yield (
+                _build_status_message("Missing reference audio", message),
+                None,
+                None,
+                message,
+                telemetry_html(),
+                progress_strip_html(),
+                header_progress_html(),
+                idle_button_update(),
+                gr.update(interactive=False),
+            )
             return
         if (
             reference_audio_file
@@ -1958,7 +2462,17 @@ def run_generation(
                 "Reference transcript is required for uploaded reference audio unless "
                 "X-Vector only mode is enabled."
             )
-            yield _build_status_message("Missing reference transcript", message), None, None, message, telemetry_html(), progress_strip_html()
+            yield (
+                _build_status_message("Missing reference transcript", message),
+                None,
+                None,
+                message,
+                telemetry_html(),
+                progress_strip_html(),
+                header_progress_html(),
+                idle_button_update(),
+                gr.update(interactive=False),
+            )
             return
         if (
             continuation_chain
@@ -1970,7 +2484,17 @@ def run_generation(
                 "Continuation chain mode requires a reference transcript for the initial anchor "
                 "(reference text or transcript file)."
             )
-            yield _build_status_message("Missing continuation transcript", message), None, None, message, telemetry_html(), progress_strip_html()
+            yield (
+                _build_status_message("Missing continuation transcript", message),
+                None,
+                None,
+                message,
+                telemetry_html(),
+                progress_strip_html(),
+                header_progress_html(),
+                idle_button_update(),
+                gr.update(interactive=False),
+            )
             return
 
         if text_path:
@@ -2037,11 +2561,31 @@ def run_generation(
             command.extend(["--stop-after-batch", str(int(stop_after_batch))])
     except Exception as exc:
         message = f"Input preparation failed: {exc}"
-        yield _build_status_message("Unable to prepare job", message), None, None, message, telemetry_html(), progress_strip_html()
+        yield (
+            _build_status_message("Unable to prepare job", message),
+            None,
+            None,
+            message,
+            telemetry_html(),
+            progress_strip_html(),
+            header_progress_html(),
+            idle_button_update(),
+            gr.update(interactive=False),
+        )
         return
 
     push_log(f"$ {' '.join(command)}")
-    yield _build_status_message("Running generation..."), None, None, "\n".join(log_lines), telemetry_html(), progress_strip_html()
+    yield (
+        _build_status_message("Running generation..."),
+        None,
+        None,
+        "\n".join(log_lines),
+        telemetry_html(),
+        progress_strip_html(),
+        header_progress_html(),
+        running_button_update(),
+        gr.update(interactive=False),
+    )
 
     started = time.time()
     process = subprocess.Popen(
@@ -2053,20 +2597,70 @@ def run_generation(
         bufsize=1,
     )
     process_pid = int(process.pid)
+    _register_active_run_process(process)
 
-    if process.stdout:
-        for line in process.stdout:
-            logs_text = push_log(line.rstrip("\n"))
-            yield _build_status_message("Running generation..."), None, None, logs_text, telemetry_html(), progress_strip_html()
+    yield (
+        _build_status_message("Running generation..."),
+        None,
+        None,
+        "\n".join(log_lines),
+        telemetry_html(),
+        progress_strip_html(),
+        header_progress_html(),
+        running_button_update(),
+        gr.update(interactive=True),
+    )
 
-    exit_code = process.wait()
+    try:
+        if process.stdout:
+            for line in process.stdout:
+                logs_text = push_log(line.rstrip("\n"))
+                yield (
+                    _build_status_message("Running generation..."),
+                    None,
+                    None,
+                    logs_text,
+                    telemetry_html(),
+                    progress_strip_html(),
+                    header_progress_html(),
+                    running_button_update(),
+                    gr.update(interactive=True),
+                )
+
+        exit_code = process.wait()
+    finally:
+        aborted_by_user = _clear_active_run_process(process)
     elapsed = time.time() - started
     logs_text = "\n".join(log_lines)
     output_path = _find_output_path(expected_output, log_lines)
 
     if exit_code != 0:
+        if aborted_by_user:
+            detail = "Generation was aborted by user request."
+            yield (
+                _build_status_message("Generation aborted", detail),
+                None,
+                None,
+                logs_text,
+                telemetry_html(),
+                progress_strip_html(),
+                header_progress_html(),
+                idle_button_update(),
+                gr.update(interactive=False),
+            )
+            return
         detail = f"CLI exited with code {exit_code}. Check logs below."
-        yield _build_status_message("Generation failed", detail), None, None, logs_text, telemetry_html(), progress_strip_html()
+        yield (
+            _build_status_message("Generation failed", detail),
+            None,
+            None,
+            logs_text,
+            telemetry_html(),
+            progress_strip_html(),
+            header_progress_html(),
+            idle_button_update(),
+            gr.update(interactive=False),
+        )
         return
 
     if output_path and output_path.exists():
@@ -2078,6 +2672,9 @@ def run_generation(
             logs_text,
             telemetry_html(),
             progress_strip_html(),
+            header_progress_html(),
+            idle_button_update(),
+            gr.update(interactive=False),
         )
         return
 
@@ -2085,7 +2682,17 @@ def run_generation(
         f"Completed in {elapsed:.1f}s, but output file was not auto-detected. "
         "Review logs for the final path."
     )
-    yield _build_status_message("Generation complete", detail), None, None, logs_text, telemetry_html(), progress_strip_html()
+    yield (
+        _build_status_message("Generation complete", detail),
+        None,
+        None,
+        logs_text,
+        telemetry_html(),
+        progress_strip_html(),
+        header_progress_html(),
+        idle_button_update(),
+        gr.update(interactive=False),
+    )
 
 
 def build_demo() -> gr.Blocks:
@@ -2268,8 +2875,158 @@ def build_demo() -> gr.Blocks:
         text-overflow: ellipsis;
     }
     .telemetry-metric.opacity-70 { opacity: 0.7; }
+    .app-title-block {
+        margin: 0 0 10px 0;
+        padding: 14px 16px;
+        border-radius: 14px;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        background:
+            radial-gradient(circle at 12% 0%, rgba(56, 189, 248, 0.16), transparent 52%),
+            linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.96));
+    }
+    .app-title-block h1 {
+        margin: 0;
+        font-size: 22px;
+        line-height: 1.2;
+        color: #0f172a;
+        letter-spacing: 0.01em;
+    }
+    .app-title-block p {
+        margin: 6px 0 0 0;
+        color: #475569;
+        font-size: 12px;
+    }
+    .header-shell {
+        margin: 0 0 10px 0;
+        padding: 12px;
+        border-radius: 14px;
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        background: linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.94));
+        box-shadow: 0 10px 26px rgba(15, 23, 42, 0.05);
+    }
+    .readiness-shell {
+        display: grid;
+        gap: 8px;
+    }
+    .readiness-summary {
+        display: inline-flex;
+        width: fit-content;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+    }
+    .readiness-summary.ready {
+        background: rgba(34, 197, 94, 0.14);
+        color: #166534;
+        border: 1px solid rgba(34, 197, 94, 0.25);
+    }
+    .readiness-summary.missing {
+        background: rgba(245, 158, 11, 0.14);
+        color: #92400e;
+        border: 1px solid rgba(245, 158, 11, 0.25);
+    }
+    .readiness-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 8px;
+    }
+    .readiness-pill {
+        display: grid;
+        gap: 2px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        background: rgba(255, 255, 255, 0.84);
+    }
+    .readiness-pill.ready {
+        border-color: rgba(34, 197, 94, 0.28);
+        background: rgba(240, 253, 244, 0.9);
+    }
+    .readiness-pill.missing {
+        border-color: rgba(245, 158, 11, 0.28);
+        background: rgba(255, 251, 235, 0.9);
+    }
+    .readiness-label {
+        font-size: 10px;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .readiness-symbol {
+        font-size: 12px;
+        font-weight: 700;
+        color: #0f172a;
+    }
+    .readiness-detail {
+        font-size: 11px;
+        color: #475569;
+        line-height: 1.25;
+    }
+    .header-actions {
+        display: grid;
+        gap: 8px;
+    }
+    .header-run-progress {
+        display: grid;
+        gap: 6px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.20);
+        background: rgba(255, 255, 255, 0.86);
+    }
+    .header-run-top {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 10px;
+        align-items: center;
+        font-size: 11px;
+    }
+    .header-run-phase {
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #e0f2fe;
+        color: #0c4a6e;
+        font-weight: 700;
+        text-transform: lowercase;
+    }
+    .header-run-pct, .header-run-eta {
+        color: #334155;
+        white-space: nowrap;
+    }
+    .header-run-bar {
+        height: 8px;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.25);
+        overflow: hidden;
+        border: 1px solid rgba(148, 163, 184, 0.18);
+    }
+    .header-run-fill {
+        height: 100%;
+        border-radius: 999px;
+        transition: width 0.16s ease-out;
+        box-shadow: 0 0 10px rgba(56, 189, 248, 0.2);
+    }
+    .section-block > details {
+        border-radius: 12px;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        background: rgba(248, 250, 252, 0.85);
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.03);
+    }
+    .section-block > details > summary {
+        font-weight: 700;
+    }
     """
     audio_types = sorted(REFERENCE_AUDIO_EXTENSIONS)
+    text_library_choices = _text_library_dropdown_choices()
+    initial_text_library_value = text_library_choices[0][1] if text_library_choices else None
+    initial_text_library_status = (
+        f"Text library ready: {len(text_library_choices)} file(s) in `{_ensure_text_library_dir()}`."
+        if text_library_choices
+        else f"No `.txt`/`.epub` files found in `{_ensure_text_library_dir()}` yet."
+    )
     voice_library_choices = _voice_dropdown_choices()
     initial_voice_library_value = voice_library_choices[0][1] if voice_library_choices else None
     (
@@ -2291,30 +3048,57 @@ def build_demo() -> gr.Blocks:
         "Custom Word + Number",
         "Custom Regex",
     ]
+    quickstart_preset_choices = [
+        "Balanced (Recommended)",
+        "Long Book + Quality",
+        "Fast Draft / Low VRAM",
+        "Highest Continuity (Slower)",
+    ]
+    initial_readiness_header = render_generation_readiness_header(
+        "",
+        None,
+        None,
+        "",
+        "",
+        None,
+        False,
+        None,
+        "audiobook.mp3",
+        DEFAULT_MODEL_ID,
+        "cuda:0",
+        DEFAULT_TTS_BACKEND,
+        DEFAULT_MAX_CHARS,
+        DEFAULT_PAUSE_MS,
+        DEFAULT_CHAPTER_PAUSE_MS,
+    )
+    initial_header_progress = _reset_header_progress_panel()
 
     with gr.Blocks(
-        title="MOSS/Qwen Audiobook Studio",
+        title="TTS Audiobook generator",
         theme=gr.themes.Soft(primary_hue="sky", neutral_hue="slate"),
         css=css,
     ) as demo:
-        gr.Markdown(
-            "## MOSS/Qwen Audiobook Studio\n"
-            "Step-by-step audiobook workspace: prepare text, prepare/select voices, run generation, then monitor and post-process."
+        gr.HTML(
+            "<div class='app-shell app-title-block'>"
+            "<h1>TTS Audiobook generator</h1>"
+            "<p>Sections for Quick Start, Book Editor, Voice Lab, Audio Lab, Multi-Speaker, Settings, and a persistent monitor.</p>"
+            "</div>"
         )
 
-        progress_strip = gr.HTML(
-            value=_render_compact_progress_strip(
-                log_lines=[],
-                started_at=None,
-                expected_output=None,
-            ),
-            elem_classes=["app-shell", "sticky-progress-wrap"],
-        )
+        with gr.Row(elem_classes=["app-shell", "header-shell"]):
+            with gr.Column(scale=3):
+                readiness_header = gr.HTML(value=initial_readiness_header)
+            with gr.Column(scale=2, elem_classes=["header-actions"]):
+                header_inline_status = gr.Markdown("### Header\n\nWaiting for setup checks.")
+                header_progress_panel = gr.HTML(value=initial_header_progress)
+                with gr.Row():
+                    run_button = gr.Button("GENERATE", variant="primary", size="lg")
+                    abort_button = gr.Button("ABORT", variant="stop", interactive=False)
 
-        with gr.Tabs(selected="step1_text", elem_classes=["app-shell"]) as workflow_tabs:
-            with gr.Tab("Step 1. Text Editing + Chapter Generation", id="step1_text"):
+        with gr.Column(elem_classes=["app-shell"]) as workflow_sections:
+            with gr.Accordion("Book Editor", open=True, elem_classes=["section-block"]):
                 gr.Markdown(
-                    "Start here: add or edit book text, preview chunking, and insert chapter markers before rendering."
+                    "Import/edit book text, clean chapters, preview chunking, and save reusable `.txt` files into `/text` for Quick Start."
                 )
                 with gr.Row(elem_classes=["app-shell"]):
                     with gr.Column(scale=2):
@@ -2331,18 +3115,20 @@ def build_demo() -> gr.Blocks:
                         book_import_status = gr.Markdown(
                             "### Book Import\n\nUpload a `.txt` or `.epub` file to load it into the editor."
                         )
+                        with gr.Row():
+                            book_save_name = gr.Textbox(
+                                label="Save editor text as (.txt in /text)",
+                                value="book_editor_export.txt",
+                            )
+                            book_save_button = gr.Button("Save To /text", variant="secondary")
+                        book_save_status = gr.Markdown("### Book Save\n\nReady")
                     with gr.Column(scale=1):
                         gr.Markdown(
-                            "### Workflow\n\n"
+                            "### Book Editor Workflow\n\n"
                             "1. Paste/upload text (`.txt`/`.epub` supported).\n"
-                            "2. Load into Chapter Assist.\n"
-                            "3. Build/preview regex.\n"
-                            "4. Insert `[CHAPTER]` markers.\n"
-                            "5. Apply back to Book Text."
-                        )
-                        step1_next_to_step2_button = gr.Button(
-                            "Next Step: Voice Lab (Step 2)",
-                            variant="primary",
+                            "2. EPUB imports auto-clean and auto-tag chapter headings.\n"
+                            "3. Use Chapter Assist regex tools for cleanup/refinement.\n"
+                            "4. Save cleaned `.txt` files to `/text` for Quick Start."
                         )
 
                 gr.Markdown(
@@ -2390,23 +3176,12 @@ def build_demo() -> gr.Blocks:
                     chapter_insert_button = gr.Button("Insert [CHAPTER] Markers", variant="primary")
                 chapter_match_preview = gr.Markdown("### Regex Matches\n\nNo preview yet.")
                 chapter_chunk_preview = gr.Markdown("### Chunk Preview\n\nNo preview yet.")
-                with gr.Row():
-                    step1_next_to_step2_button_bottom = gr.Button(
-                        "Continue to Step 2: Voice Lab",
-                        variant="primary",
-                    )
-                    step1_open_monitor_button = gr.Button(
-                        "Open Monitor",
-                        variant="secondary",
-                    )
+                gr.Markdown("Book Editor batch preview appears above in **Chunk Preview** after regex preview/insert actions.")
 
-            with gr.Tab("Step 2. Voice Lab (Browse / Create / Upload)", id="step2_voice"):
+            with gr.Accordion("Voice Lab", open=False, elem_classes=["section-block"]):
                 gr.Markdown(
-                    "Pick a voice for generation, preview existing voices, upload new voice assets into `/voices`, or create a synthetic voice preset."
+                    "Voice creation, previewing, and `/voices` management. Quick Start can also pull from the same `/voices` library."
                 )
-                with gr.Row():
-                    step2_back_to_step1_button = gr.Button("Back to Step 1: Text", variant="secondary")
-                    step2_next_to_step3_button = gr.Button("Next Step: Main Generation (Step 3)", variant="primary")
                 with gr.Row(elem_classes=["app-shell"]):
                     with gr.Column(scale=1):
                         gr.Markdown("### Voice Library Browser")
@@ -2421,7 +3196,7 @@ def build_demo() -> gr.Blocks:
                             voice_library_refresh_button = gr.Button("Refresh", scale=1, variant="secondary")
                         with gr.Row():
                             voice_library_apply_button = gr.Button(
-                                "Use Selected Voice In Step 3",
+                                "Use Selected Voice In Quick Start",
                                 variant="secondary",
                                 scale=2,
                             )
@@ -2530,33 +3305,72 @@ def build_demo() -> gr.Blocks:
                         voice_lab_preview_audio = gr.Audio(label="Voice Preview Audio", type="filepath", interactive=False)
                         voice_lab_saved_file = gr.File(label="Saved Voice Preset (.voice.json)", interactive=False)
                         voice_lab_log = gr.Textbox(label="Voice Lab Log", lines=10, elem_classes=["mono-log"])
-                with gr.Row():
-                    step2_next_to_step3_button_bottom = gr.Button(
-                        "Continue to Step 3: Main Generation",
-                        variant="primary",
-                    )
-                    step2_open_monitor_button = gr.Button("Open Monitor", variant="secondary")
+                gr.Markdown("Use **Use Selected Voice In Quick Start** to push the selected voice into the generation panel.")
 
-            with gr.Tab("Step 3. Main Book Generation", id="step3_generate"):
+            with gr.Accordion("Quick Start", open=True, elem_classes=["section-block"]):
                 gr.Markdown(
-                    "Run the audiobook render. Use Step 1 for text and Step 2 to prepare/select a voice before starting."
+                    "Select text from `/text`, select a voice from `/voices`, choose model + preset, then run generation. Advanced parameters remain available below."
                 )
+                with gr.Row(elem_classes=["app-shell"]):
+                    with gr.Column(scale=1):
+                        quick_text_library_dropdown = gr.Dropdown(
+                            label="Text Library (/text)",
+                            choices=text_library_choices,
+                            value=initial_text_library_value,
+                            allow_custom_value=False,
+                        )
+                        with gr.Row():
+                            quick_text_refresh_button = gr.Button("Refresh /text", variant="secondary")
+                            quick_text_load_button = gr.Button("Load Into Book Editor", variant="primary")
+                        quick_text_library_status = gr.Markdown(initial_text_library_status)
+                    with gr.Column(scale=1):
+                        quick_voice_dropdown = gr.Dropdown(
+                            label="Voice Selector (/voices)",
+                            choices=voice_library_choices,
+                            value=initial_voice_library_value,
+                            allow_custom_value=False,
+                        )
+                        with gr.Row():
+                            quick_voice_refresh_button = gr.Button("Refresh /voices", variant="secondary")
+                            quick_voice_apply_button = gr.Button("Use Selected Voice", variant="primary")
+                        quick_voice_status = gr.Markdown(
+                            "Select a voice; matching `.txt` sidecar transcript is applied automatically."
+                        )
+                    with gr.Column(scale=1):
+                        tts_backend = gr.Dropdown(
+                            label="TTS Backend",
+                            choices=["moss-delay", "moss-local", "moss-ttsd", "qwen", "auto"],
+                            value=DEFAULT_TTS_BACKEND,
+                        )
+                        model_id = gr.Dropdown(
+                            label="Model",
+                            choices=[DEFAULT_MODEL_ID, "Qwen/Qwen3-TTS-30B-A3B-Instruct"],
+                            value=DEFAULT_MODEL_ID,
+                            allow_custom_value=True,
+                        )
+                        quickstart_preset = gr.Dropdown(
+                            label="Preset (quality / length / gpu)",
+                            choices=quickstart_preset_choices,
+                            value=quickstart_preset_choices[0],
+                        )
+                        quickstart_preset_apply_button = gr.Button("Apply Preset", variant="secondary")
+                        quickstart_preset_status = gr.Markdown(
+                            _build_status_message(
+                                "Quick Start Preset",
+                                "Balanced (Recommended) is a good default. Use Long Book + Quality for long-form consistency or Fast Draft / Low VRAM for faster iteration.",
+                            )
+                        )
                 step3_gate_status = gr.Markdown(initial_step3_gate_status_md)
                 with gr.Column(
                     visible=bool(initial_step3_locked_panel_update.get("visible", True))
                 ) as step3_locked_panel:
                     gr.Markdown(
-                        "Generation controls are hidden until Step 1 has book text. Paste/edit text or upload a `.txt` file, then return here."
+                        "Generation controls unlock after Book Editor has text (paste/edit or upload/import a `.txt`/`.epub`)."
                     )
-                    with gr.Row():
-                        step3_go_step1_button = gr.Button("Go to Step 1: Text", variant="primary")
-                        step3_check_unlock_button = gr.Button("Check for Text Again", variant="secondary")
+                    step3_check_unlock_button = gr.Button("Check for Text Again", variant="secondary")
                 with gr.Column(
                     visible=bool(initial_step3_controls_panel_update.get("visible", False))
                 ) as step3_controls_panel:
-                    with gr.Row():
-                        step3_back_to_step2_button = gr.Button("Back to Step 2: Voice Lab", variant="secondary")
-                        step3_next_monitor_button = gr.Button("Next: Monitor", variant="secondary")
                     with gr.Row(elem_classes=["app-shell"]):
                         with gr.Column(scale=2):
                             gr.Markdown("### Reference Voice + Resume")
@@ -2566,18 +3380,23 @@ def build_demo() -> gr.Blocks:
                                 type="filepath",
                             )
                             reference_audio_path = gr.Textbox(
-                                label="Reference Audio Path or URL (optional)",
-                                placeholder="Use this if you do not upload audio.",
+                                label="Reference Audio Path or URL",
+                                placeholder="Auto-filled from Quick Start voice selection, or override manually.",
                             )
                             reference_text = gr.Textbox(
-                                label="Reference Transcript (optional)",
-                                placeholder="Required unless X-Vector only mode is enabled.",
+                                label="Reference Transcript (hidden Quick Start field)",
+                                placeholder="Auto-filled from voice sidecar transcript.",
                                 lines=4,
+                                visible=False,
                             )
                             reference_text_file = gr.File(
-                                label="Reference Transcript File (.txt)",
+                                label="Reference Transcript File (.txt) (hidden Quick Start field)",
                                 file_types=[".txt"],
                                 type="filepath",
+                                visible=False,
+                            )
+                            gr.Markdown(
+                                "Quick Start hides transcript fields and expects `/voices` entries to include matching `.txt` files."
                             )
                             x_vector_only_mode = gr.Checkbox(
                                 label="X-Vector Only Mode (no transcript required)",
@@ -2628,12 +3447,6 @@ def build_demo() -> gr.Blocks:
                                 allow_custom_value=True,
                             )
                             with gr.Accordion("Advanced", open=False):
-                                tts_backend = gr.Dropdown(
-                                    label="TTS backend",
-                                    choices=["moss-delay", "moss-local", "moss-ttsd", "qwen", "auto"],
-                                    value=DEFAULT_TTS_BACKEND,
-                                )
-                                model_id = gr.Textbox(label="Model ID", value=DEFAULT_MODEL_ID)
                                 device = gr.Textbox(label="Device", value="cuda:0")
                                 dtype = gr.Dropdown(
                                     label="DType",
@@ -2675,12 +3488,9 @@ def build_demo() -> gr.Blocks:
                                     value=0,
                                     precision=0,
                                 )
-                    with gr.Row():
-                        run_button = gr.Button("Generate Audiobook", variant="primary", size="lg")
-                        clear_button = gr.Button("Clear Output", variant="secondary")
-                    gr.Markdown("Detailed run telemetry and logs are available in the **Monitor** tab.")
+                    gr.Markdown("Use the header **GENERATE** button to start. Progress + abort controls stay visible in the header.")
 
-            with gr.Tab("Step 4. Multi-Speaker Generation", id="step4_multi"):
+            with gr.Accordion("Multi-Speaker", open=False, elem_classes=["section-block"]):
                 gr.Markdown(
                     "Workspace for future multi-speaker rendering. Keep script/dialogue prep here while the backend flow is added."
                 )
@@ -2708,9 +3518,9 @@ def build_demo() -> gr.Blocks:
                         "- Batch render queue"
                     )
 
-            with gr.Tab("Step 5. Pre / Post-Processing Tools", id="step5_tools"):
+            with gr.Accordion("Audio Lab", open=False, elem_classes=["section-block"]):
                 gr.Markdown(
-                    "Pre/post-processing workspace for reference prep and output finishing tools."
+                    "Pre-process and post-process audio tooling. Existing and planned wrappers live here."
                 )
                 with gr.Accordion("Pre-Processing (Reference Audio / Text)", open=True):
                     gr.Markdown(
@@ -2736,13 +3546,28 @@ def build_demo() -> gr.Blocks:
                         placeholder="List post-processing steps you want to automate next.",
                     )
 
-            with gr.Tab("Monitor (Telemetry + Logs)", id="monitor"):
+            with gr.Accordion("Settings", open=False, elem_classes=["section-block"]):
                 gr.Markdown(
-                    "Detailed run status, telemetry, outputs, and logs. The sticky progress bar at the top stays minimal while you work in other tabs."
+                    "Turn telemetry/monitor displays on or off and keep UI-level viewing preferences here."
                 )
-                status = gr.Markdown("### Ready")
+                with gr.Row():
+                    show_graphical_monitor = gr.Checkbox(label="Show graphical monitor", value=True)
+                    show_defrag_viewer = gr.Checkbox(label="Show defrag viewer", value=True)
+                    show_console_output = gr.Checkbox(label="Show console output", value=True)
+                settings_status = gr.Markdown(
+                    _build_status_message(
+                        "Settings",
+                        "All persistent monitor panels are currently visible.",
+                    )
+                )
+
+            with gr.Accordion("Persistent Monitor", open=True, elem_classes=["section-block"]):
+                gr.Markdown(
+                    "1) graphical monitor, 2) defrag viewer, 3) console output. This monitor stays below all sections."
+                )
                 with gr.Row(elem_classes=["app-shell"]):
-                    with gr.Column(scale=3):
+                    with gr.Column(scale=3, visible=True) as monitor_graph_panel:
+                        gr.Markdown("### 1. Graphical Monitor")
                         telemetry = gr.HTML(
                             value=_render_telemetry_panel(
                                 log_lines=[],
@@ -2756,13 +3581,26 @@ def build_demo() -> gr.Blocks:
                                 cache={},
                             )
                         )
-                    with gr.Column(scale=2):
-                        logs = gr.Textbox(label="Run Log", lines=18, elem_classes=["mono-log"])
-                with gr.Row(elem_classes=["app-shell"]):
-                    with gr.Column(scale=2):
-                        audio_output = gr.Audio(label="Output Preview", type="filepath", interactive=False)
-                    with gr.Column(scale=1):
-                        file_output = gr.File(label="Download Output", interactive=False)
+                    with gr.Column(scale=3, visible=True) as monitor_defrag_panel:
+                        gr.Markdown("### 2. Defrag Viewer")
+                        status = gr.Markdown("### Ready")
+                        progress_strip = gr.HTML(
+                            value=_render_compact_progress_strip(
+                                log_lines=[],
+                                started_at=None,
+                                expected_output=None,
+                            ),
+                        )
+                        with gr.Row():
+                            clear_button = gr.Button("Clear Monitor Output", variant="secondary")
+                        with gr.Row():
+                            with gr.Column(scale=2):
+                                audio_output = gr.Audio(label="Output Preview", type="filepath", interactive=False)
+                            with gr.Column(scale=1):
+                                file_output = gr.File(label="Download Output", interactive=False)
+                    with gr.Column(scale=2, visible=True) as monitor_console_panel:
+                        gr.Markdown("### 3. Console Output")
+                        logs = gr.Textbox(label="Run Log", lines=22, elem_classes=["mono-log"])
 
         run_button.click(
             fn=run_generation,
@@ -2794,7 +3632,22 @@ def build_demo() -> gr.Blocks:
                 continuation_anchor_seconds,
                 stop_after_batch,
             ],
-            outputs=[status, audio_output, file_output, logs, telemetry, progress_strip],
+            outputs=[
+                status,
+                audio_output,
+                file_output,
+                logs,
+                telemetry,
+                progress_strip,
+                header_progress_panel,
+                run_button,
+                abort_button,
+            ],
+        )
+        run_button.click(
+            fn=lambda: _build_status_message("Header", "Generation in progress. Use ABORT to stop the active backend process."),
+            outputs=[header_inline_status],
+            queue=False,
         )
 
         clear_button.click(
@@ -2819,55 +3672,140 @@ def build_demo() -> gr.Blocks:
                     started_at=None,
                     expected_output=None,
                 ),
+                _reset_header_progress_panel(),
+                _run_button_update(
+                    log_lines=[],
+                    started_at=None,
+                    expected_output=None,
+                    is_running=False,
+                ),
+                gr.update(interactive=False),
             ),
-            outputs=[status, audio_output, file_output, logs, telemetry, progress_strip],
+            outputs=[
+                status,
+                audio_output,
+                file_output,
+                logs,
+                telemetry,
+                progress_strip,
+                header_progress_panel,
+                run_button,
+                abort_button,
+            ],
+        )
+        clear_button.click(
+            fn=lambda: _build_status_message("Header", "Monitor output cleared."),
+            outputs=[header_inline_status],
         )
 
-        step1_next_to_step2_button.click(
-            fn=lambda: _select_workflow_tab("step2_voice"),
-            outputs=[workflow_tabs],
+        abort_button.click(
+            fn=abort_generation,
+            outputs=[status, header_inline_status, run_button, abort_button],
+            queue=False,
         )
-        step1_next_to_step2_button_bottom.click(
-            fn=lambda: _select_workflow_tab("step2_voice"),
-            outputs=[workflow_tabs],
+
+        readiness_inputs = [
+            text_input,
+            text_file,
+            reference_audio_file,
+            reference_audio_path,
+            reference_text,
+            reference_text_file,
+            x_vector_only_mode,
+            resume_state_file,
+            output_name,
+            model_id,
+            device,
+            tts_backend,
+            max_chars_per_batch,
+            pause_ms,
+            chapter_pause_ms,
+        ]
+
+        quick_text_refresh_button.click(
+            fn=refresh_text_library_dropdown,
+            inputs=[quick_text_library_dropdown],
+            outputs=[quick_text_library_dropdown, quick_text_library_status],
         )
-        step1_open_monitor_button.click(
-            fn=lambda: _select_workflow_tab("monitor"),
-            outputs=[workflow_tabs],
+        quick_text_load_event = quick_text_load_button.click(
+            fn=_load_book_file_into_editor,
+            inputs=[quick_text_library_dropdown],
+            outputs=[text_input, book_import_status],
         )
-        step2_back_to_step1_button.click(
-            fn=lambda: _select_workflow_tab("step1_text"),
-            outputs=[workflow_tabs],
+        quick_text_load_event.then(
+            fn=_step3_gate_visibility_updates,
+            inputs=[text_input, text_file],
+            outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
         )
-        step2_next_to_step3_button.click(
-            fn=lambda: _select_workflow_tab("step3_generate"),
-            outputs=[workflow_tabs],
+        quick_text_load_event.then(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
         )
-        step2_next_to_step3_button_bottom.click(
-            fn=lambda: _select_workflow_tab("step3_generate"),
-            outputs=[workflow_tabs],
+
+        book_save_button.click(
+            fn=save_book_editor_text_to_library,
+            inputs=[book_save_name, text_input, quick_text_library_dropdown],
+            outputs=[book_save_status, quick_text_library_dropdown, quick_text_library_status, book_save_name],
         )
-        step2_open_monitor_button.click(
-            fn=lambda: _select_workflow_tab("monitor"),
-            outputs=[workflow_tabs],
+
+        quick_voice_refresh_button.click(
+            fn=refresh_quick_voice_selector,
+            inputs=[quick_voice_dropdown],
+            outputs=[quick_voice_dropdown, quick_voice_status],
         )
-        step3_go_step1_button.click(
-            fn=lambda: _select_workflow_tab("step1_text"),
-            outputs=[workflow_tabs],
+        quick_voice_apply_event = quick_voice_apply_button.click(
+            fn=apply_quickstart_voice_selection,
+            inputs=[
+                quick_voice_dropdown,
+                reference_audio_path,
+                reference_text,
+                voice_lab_name,
+                voice_lab_description,
+            ],
+            outputs=[
+                reference_audio_path,
+                reference_text,
+                voice_lab_name,
+                voice_lab_description,
+                quick_voice_status,
+                voice_library_dropdown,
+            ],
         )
-        step3_back_to_step2_button.click(
-            fn=lambda: _select_workflow_tab("step2_voice"),
-            outputs=[workflow_tabs],
+        quick_voice_apply_event.then(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
         )
-        step3_next_monitor_button.click(
-            fn=lambda: _select_workflow_tab("monitor"),
-            outputs=[workflow_tabs],
+
+        quickstart_preset_event = quickstart_preset_apply_button.click(
+            fn=apply_quickstart_preset,
+            inputs=[quickstart_preset],
+            outputs=[
+                max_chars_per_batch,
+                pause_ms,
+                chapter_pause_ms,
+                mp3_quality,
+                inference_batch_size,
+                continuation_chain,
+                quickstart_preset_status,
+            ],
+        )
+        quickstart_preset_event.then(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
         )
 
         text_input.change(
             fn=_step3_gate_visibility_updates,
             inputs=[text_input, text_file],
             outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
+        )
+        text_input.change(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
         )
         text_file.change(
             fn=_load_book_file_into_editor,
@@ -2879,13 +3817,23 @@ def build_demo() -> gr.Blocks:
             inputs=[text_input, text_file],
             outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
         )
+        text_file.change(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
+        )
         step3_check_unlock_button.click(
             fn=_step3_gate_visibility_updates,
             inputs=[text_input, text_file],
             outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
         )
+        step3_check_unlock_button.click(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
+        )
 
-        voice_library_refresh_button.click(
+        voice_library_refresh_event = voice_library_refresh_button.click(
             fn=refresh_voice_library_workspace,
             inputs=[voice_library_dropdown],
             outputs=[
@@ -2899,7 +3847,13 @@ def build_demo() -> gr.Blocks:
                 voice_library_inspector_status,
             ],
         )
-        voice_lab_refresh_button.click(
+        voice_library_refresh_event.then(
+            fn=refresh_quick_voice_selector,
+            inputs=[quick_voice_dropdown],
+            outputs=[quick_voice_dropdown, quick_voice_status],
+        )
+
+        voice_lab_refresh_event = voice_lab_refresh_button.click(
             fn=refresh_voice_library_workspace,
             inputs=[voice_library_dropdown],
             outputs=[
@@ -2913,7 +3867,13 @@ def build_demo() -> gr.Blocks:
                 voice_library_inspector_status,
             ],
         )
-        voice_library_apply_button.click(
+        voice_lab_refresh_event.then(
+            fn=refresh_quick_voice_selector,
+            inputs=[quick_voice_dropdown],
+            outputs=[quick_voice_dropdown, quick_voice_status],
+        )
+
+        voice_library_apply_event = voice_library_apply_button.click(
             fn=apply_voice_library_selection,
             inputs=[
                 voice_library_dropdown,
@@ -2935,7 +3895,18 @@ def build_demo() -> gr.Blocks:
                 voice_library_inspector_status,
             ],
         )
-        voice_library_dropdown.change(
+        voice_library_apply_event.then(
+            fn=lambda value: gr.update(value=value),
+            inputs=[voice_library_dropdown],
+            outputs=[quick_voice_dropdown],
+        )
+        voice_library_apply_event.then(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
+        )
+
+        voice_library_dropdown_change_event = voice_library_dropdown.change(
             fn=apply_voice_library_selection,
             inputs=[
                 voice_library_dropdown,
@@ -2956,6 +3927,16 @@ def build_demo() -> gr.Blocks:
                 voice_library_metadata_text,
                 voice_library_inspector_status,
             ],
+        )
+        voice_library_dropdown_change_event.then(
+            fn=lambda value: gr.update(value=value),
+            inputs=[voice_library_dropdown],
+            outputs=[quick_voice_dropdown],
+        )
+        voice_library_dropdown_change_event.then(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
         )
         voice_library_preview_button.click(
             fn=inspect_voice_library_selection_for_preview,
@@ -2968,7 +3949,7 @@ def build_demo() -> gr.Blocks:
                 voice_library_inspector_status,
             ],
         )
-        voice_library_upload_button.click(
+        voice_library_upload_event = voice_library_upload_button.click(
             fn=import_voice_library_files,
             inputs=[
                 voice_library_upload_files,
@@ -2988,7 +3969,13 @@ def build_demo() -> gr.Blocks:
                 voice_library_upload_files,
             ],
         )
-        voice_lab_generate_button.click(
+        voice_library_upload_event.then(
+            fn=refresh_quick_voice_selector,
+            inputs=[quick_voice_dropdown],
+            outputs=[quick_voice_dropdown, quick_voice_status],
+        )
+
+        voice_lab_generate_event = voice_lab_generate_button.click(
             fn=generate_voice_from_description,
             inputs=[
                 voice_lab_name,
@@ -3012,6 +3999,16 @@ def build_demo() -> gr.Blocks:
                 reference_text,
             ],
         )
+        voice_lab_generate_event.then(
+            fn=refresh_quick_voice_selector,
+            inputs=[quick_voice_dropdown],
+            outputs=[quick_voice_dropdown, quick_voice_status],
+        )
+        voice_lab_generate_event.then(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
+        )
 
         chapter_assist_load_main_button.click(
             fn=_copy_text_or_blank,
@@ -3027,6 +4024,11 @@ def build_demo() -> gr.Blocks:
             fn=_step3_gate_visibility_updates,
             inputs=[text_input, text_file],
             outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
+        )
+        chapter_assist_apply_main_event.then(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
         )
         chapter_build_pattern_button.click(
             fn=lambda preset, custom_word, custom_regex: (
@@ -3076,6 +4078,34 @@ def build_demo() -> gr.Blocks:
                 chapter_assist_status,
             ],
         )
+
+        for readiness_component in [
+            reference_audio_file,
+            reference_audio_path,
+            reference_text,
+            reference_text_file,
+            x_vector_only_mode,
+            resume_state_file,
+            output_name,
+            model_id,
+            device,
+            tts_backend,
+            max_chars_per_batch,
+            pause_ms,
+            chapter_pause_ms,
+        ]:
+            readiness_component.change(
+                fn=render_generation_readiness_header,
+                inputs=readiness_inputs,
+                outputs=[readiness_header],
+            )
+
+        for monitor_toggle in [show_graphical_monitor, show_defrag_viewer, show_console_output]:
+            monitor_toggle.change(
+                fn=apply_monitor_visibility_settings,
+                inputs=[show_graphical_monitor, show_defrag_viewer, show_console_output],
+                outputs=[monitor_graph_panel, monitor_defrag_panel, monitor_console_panel],
+            )
 
     return demo
 

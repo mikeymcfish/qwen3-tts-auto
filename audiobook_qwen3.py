@@ -400,6 +400,21 @@ _EPUB_NOTE_KEYWORDS = (
     "page-list",
     "landmarks",
 )
+_EPUB_CHAPTER_HEADING_KEYWORDS = (
+    "chapter",
+    "prologue",
+    "epilogue",
+    "preface",
+    "appendix",
+    "part",
+    "book",
+    "act",
+    "scene",
+)
+_EPUB_CHAPTER_HEADING_RE = re.compile(
+    r"^\s*(?:chapter|part|book|act|scene)\b|^\s*(?:prologue|epilogue|preface|appendix)\b",
+    re.IGNORECASE,
+)
 _HEADING_PAUSE_PUNCTUATION_RE = re.compile(r"[.!?:;](?:[\"')\]]+)?$")
 
 
@@ -552,6 +567,61 @@ def _epub_collect_blocks(elem: ET.Element, blocks: list[str]) -> None:
         _epub_collect_blocks(child, blocks)
 
 
+def _normalize_epub_heading_match_text(text: str) -> str:
+    cleaned = _epub_clean_block_text(text)
+    cleaned = re.sub(r"[.!?:;]+$", "", cleaned).strip().lower()
+    return cleaned
+
+
+def _looks_like_epub_chapter_heading(text: str, metadata_blob: str, tag: str) -> bool:
+    heading_text = _epub_clean_block_text(text)
+    if not heading_text:
+        return False
+    lower_blob = str(metadata_blob or "").lower()
+    if any(keyword in lower_blob for keyword in _EPUB_CHAPTER_HEADING_KEYWORDS):
+        return True
+    if _EPUB_CHAPTER_HEADING_RE.search(heading_text):
+        return True
+    if tag in {"h1", "h2"} and len(heading_text) <= 120:
+        # Many EPUBs split chapters into one XHTML file per chapter with a top-level heading.
+        return True
+    return False
+
+
+def _epub_find_document_chapter_title(body_elem: ET.Element) -> str | None:
+    for elem in body_elem.iter():
+        if _epub_should_skip_element(elem):
+            continue
+        tag = _xml_local_name(str(elem.tag))
+        if tag not in _EPUB_HEADING_TAGS:
+            continue
+        heading_text = _epub_clean_block_text(_epub_collect_inline_text(elem))
+        if not heading_text or _epub_is_ignorable_block(elem, heading_text):
+            continue
+        if _looks_like_epub_chapter_heading(heading_text, _epub_attr_blob(elem), tag):
+            return heading_text
+    return None
+
+
+def _epub_insert_chapter_marker_block(blocks: list[str], chapter_title: str | None) -> list[str]:
+    if not chapter_title or len(blocks) < 2:
+        return blocks
+    marker_line = f"{CHAPTER_TAG} {chapter_title}".strip()
+    marker_norm = _normalize_epub_heading_match_text(marker_line)
+    if not marker_norm:
+        return blocks
+    if any(_normalize_epub_heading_match_text(block) == marker_norm for block in blocks[:4]):
+        return blocks
+
+    heading_norm = _normalize_epub_heading_match_text(chapter_title)
+    insert_index = 0
+    for idx, block in enumerate(blocks[:8]):
+        if _normalize_epub_heading_match_text(block) == heading_norm:
+            insert_index = idx
+            break
+    return [*blocks[:insert_index], marker_line, *blocks[insert_index:]]
+
+
 def _epub_resolve_zip_path(base_path: str, href: str) -> str:
     clean_href = str(href or "").split("#", 1)[0].strip()
     if not clean_href:
@@ -647,7 +717,8 @@ def _extract_epub_text(archive: zipfile.ZipFile, path: str) -> list[str]:
 
     blocks: list[str] = []
     _epub_collect_blocks(body_elem, blocks)
-    return blocks
+    chapter_title = _epub_find_document_chapter_title(body_elem)
+    return _epub_insert_chapter_marker_block(blocks, chapter_title)
 
 
 def read_epub_file(path: Path) -> str:

@@ -15,6 +15,8 @@ class EpubImportTests(unittest.TestCase):
             text = read_text_file(epub_path)
             paragraphs = split_into_paragraphs(text)
 
+            self.assertIn("[CHAPTER] Chapter One", text)
+            self.assertIn("[CHAPTER] Chapter Two:", text)
             self.assertIn("Chapter One.", paragraphs)
             self.assertIn("A paragraph before an image.", paragraphs)
             self.assertIn("Paragraph with note marker and more text.", paragraphs)
