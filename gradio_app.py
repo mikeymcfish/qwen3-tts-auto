@@ -40,6 +40,7 @@ from audiobook_qwen3 import (
     choose_dtype,
     extract_chapter_titles_from_raw_text,
     is_unused_audio_generate_kwargs_error,
+    read_text_file,
     require_runtime_dependencies,
     split_into_paragraphs,
 )
@@ -89,6 +90,57 @@ def _write_text_input(text: str, target_path: Path) -> None:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(normalized + "\n", encoding="utf-8", newline="\n")
+
+
+def _load_book_file_into_editor(book_file_path: str | None) -> tuple[Any, str]:
+    if not book_file_path:
+        return (
+            gr.update(),
+            _build_status_message(
+                "Book Import",
+                "Upload a `.txt` or `.epub` file to load it into the editor.",
+            ),
+        )
+
+    source = Path(book_file_path).expanduser().resolve()
+    if not source.exists() or not source.is_file():
+        return (
+            gr.update(),
+            _build_status_message("Book Import Failed", f"File not found: `{source}`"),
+        )
+
+    if source.suffix.lower() not in {".txt", ".epub"}:
+        return (
+            gr.update(),
+            _build_status_message(
+                "Book Import Failed",
+                "Unsupported format. Upload a `.txt` or `.epub` file.",
+            ),
+        )
+
+    try:
+        imported_text = read_text_file(source)
+    except Exception as exc:
+        return (
+            gr.update(),
+            _build_status_message("Book Import Failed", f"`{source.name}`: {exc}"),
+        )
+
+    normalized = imported_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return (
+            gr.update(),
+            _build_status_message(
+                "Book Import Failed",
+                f"`{source.name}` did not contain usable text after cleanup.",
+            ),
+        )
+
+    detail = (
+        f"Loaded `{source.name}` into the editor."
+        + (" EPUB cleanup removed common notes/media markup and normalized headings." if source.suffix.lower() == ".epub" else "")
+    )
+    return normalized, _build_status_message("Book Import", detail)
 
 
 def _find_output_path(
@@ -1770,7 +1822,7 @@ def _step3_gate_markdown(text_value: str, text_file_value: str | None) -> str:
         )
     return (
         "### Step 3 Locked\n\n"
-        "Add text in Step 1 (paste/edit or upload a `.txt` file) to unlock generation controls."
+        "Add text in Step 1 (paste/edit or upload a `.txt`/`.epub` file) to unlock generation controls."
     )
 
 
@@ -1887,7 +1939,7 @@ def run_generation(
         )
 
         if not resume_state_path and not text_path:
-            message = "Provide book text (paste text or upload a .txt file), or upload a resume state."
+            message = "Provide book text (paste text or upload a .txt/.epub file), or upload a resume state."
             yield _build_status_message("Missing input", message), None, None, message, telemetry_html(), progress_strip_html()
             return
         if not resume_state_path and not reference_audio_value:
@@ -2267,18 +2319,21 @@ def build_demo() -> gr.Blocks:
                     with gr.Column(scale=2):
                         text_input = gr.Textbox(
                             label="Book Text (optional)",
-                            placeholder="Paste text here, or upload a .txt file below.",
+                            placeholder="Paste text here, or upload a .txt/.epub file below.",
                             lines=14,
                         )
                         text_file = gr.File(
-                            label="Book Text File (.txt)",
-                            file_types=[".txt"],
+                            label="Book Text File (.txt or .epub)",
+                            file_types=[".txt", ".epub"],
                             type="filepath",
+                        )
+                        book_import_status = gr.Markdown(
+                            "### Book Import\n\nUpload a `.txt` or `.epub` file to load it into the editor."
                         )
                     with gr.Column(scale=1):
                         gr.Markdown(
                             "### Workflow\n\n"
-                            "1. Paste/upload text.\n"
+                            "1. Paste/upload text (`.txt`/`.epub` supported).\n"
                             "2. Load into Chapter Assist.\n"
                             "3. Build/preview regex.\n"
                             "4. Insert `[CHAPTER]` markers.\n"
@@ -2812,6 +2867,11 @@ def build_demo() -> gr.Blocks:
             fn=_step3_gate_visibility_updates,
             inputs=[text_input, text_file],
             outputs=[step3_locked_panel, step3_controls_panel, step3_gate_status],
+        )
+        text_file.change(
+            fn=_load_book_file_into_editor,
+            inputs=[text_file],
+            outputs=[text_input, book_import_status],
         )
         text_file.change(
             fn=_step3_gate_visibility_updates,

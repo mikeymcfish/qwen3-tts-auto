@@ -8,9 +8,11 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import html
 import importlib
 import importlib.util
 import json
+import posixpath
 import re
 import shutil
 import shlex
@@ -19,11 +21,13 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import TextIOBase
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from xml.etree import ElementTree as ET
 
 APP_VERSION = "0.1.0"
 DEFAULT_TTS_BACKEND = "moss-delay"
@@ -365,7 +369,313 @@ def format_plain_progress(
     )
 
 
+_EPUB_HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+_EPUB_BLOCK_TAGS = {"p", "li", "dt", "dd", "pre"}
+_EPUB_SKIP_TAGS = {
+    "script",
+    "style",
+    "img",
+    "svg",
+    "figure",
+    "figcaption",
+    "audio",
+    "video",
+    "source",
+    "canvas",
+    "iframe",
+    "noscript",
+    "form",
+    "input",
+    "button",
+    "label",
+    "nav",
+}
+_EPUB_NOTE_KEYWORDS = (
+    "footnote",
+    "endnote",
+    "noteref",
+    "annotation",
+    "pagebreak",
+    "pagenum",
+    "page-list",
+    "landmarks",
+)
+_HEADING_PAUSE_PUNCTUATION_RE = re.compile(r"[.!?:;](?:[\"')\]]+)?$")
+
+
+def _xml_local_name(name: str) -> str:
+    text = str(name or "")
+    if "}" in text:
+        text = text.split("}", 1)[1]
+    if ":" in text:
+        text = text.split(":", 1)[1]
+    return text.lower()
+
+
+def _epub_attr_map(elem: ET.Element) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for key, value in elem.attrib.items():
+        attrs[_xml_local_name(str(key))] = str(value or "")
+    return attrs
+
+
+def _epub_attr_blob(elem: ET.Element) -> str:
+    attrs = _epub_attr_map(elem)
+    parts = [
+        attrs.get("class", ""),
+        attrs.get("id", ""),
+        attrs.get("role", ""),
+        attrs.get("style", ""),
+        attrs.get("aria-label", ""),
+    ]
+    type_value = attrs.get("type", "")
+    if type_value:
+        parts.append(type_value)
+    return " ".join(part for part in parts if part).lower()
+
+
+def _looks_like_epub_note_metadata(blob: str) -> bool:
+    blob_value = str(blob or "").lower()
+    return any(keyword in blob_value for keyword in _EPUB_NOTE_KEYWORDS)
+
+
+def _ensure_heading_pause_punctuation(text: str) -> str:
+    normalized = re.sub(r"[ \t]+", " ", str(text or "").strip())
+    if not normalized:
+        return ""
+    if _HEADING_PAUSE_PUNCTUATION_RE.search(normalized):
+        return normalized
+    return f"{normalized}."
+
+
+def _epub_should_skip_element(elem: ET.Element) -> bool:
+    tag = _xml_local_name(str(elem.tag))
+    if tag in _EPUB_SKIP_TAGS:
+        return True
+    attrs = _epub_attr_map(elem)
+    if "hidden" in attrs:
+        return True
+    if attrs.get("aria-hidden", "").strip().lower() == "true":
+        return True
+    style = attrs.get("style", "").replace(" ", "").lower()
+    if "display:none" in style or "visibility:hidden" in style:
+        return True
+    metadata_blob = _epub_attr_blob(elem)
+    if tag == "a" and "noteref" in metadata_blob:
+        return True
+    if tag == "sup":
+        # Superscripts in ebooks are commonly note markers that sound bad in TTS.
+        return True
+    if _looks_like_epub_note_metadata(metadata_blob):
+        return True
+    return False
+
+
+def _epub_collect_inline_text(elem: ET.Element) -> str:
+    if _epub_should_skip_element(elem):
+        return ""
+    parts: list[str] = []
+    if elem.text:
+        parts.append(elem.text)
+    for child in list(elem):
+        if _epub_should_skip_element(child):
+            if child.tail:
+                parts.append(child.tail)
+            continue
+        child_tag = _xml_local_name(str(child.tag))
+        if child_tag == "br":
+            parts.append("\n")
+        else:
+            parts.append(_epub_collect_inline_text(child))
+        if child.tail:
+            parts.append(child.tail)
+    return "".join(parts)
+
+
+def _epub_clean_block_text(text: str) -> str:
+    cleaned = html.unescape(str(text or ""))
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = cleaned.replace("\xa0", " ")
+    cleaned = re.sub(r"[\u200b\u200c\u200d\ufeff]+", "", cleaned)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in cleaned.split("\n")]
+    cleaned = " ".join(line for line in lines if line)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+    return cleaned
+
+
+def _epub_is_ignorable_block(elem: ET.Element, text: str) -> bool:
+    if not text:
+        return True
+    metadata_blob = _epub_attr_blob(elem)
+    if _looks_like_epub_note_metadata(metadata_blob):
+        return True
+    if re.fullmatch(r"(?:page\s+)?\d{1,4}", text, flags=re.IGNORECASE) and (
+        "page" in metadata_blob or "pagenum" in metadata_blob
+    ):
+        return True
+    if re.fullmatch(r"\[(?:\d+|[ivxlcdm]+)\]", text, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _epub_collect_blocks(elem: ET.Element, blocks: list[str]) -> None:
+    if _epub_should_skip_element(elem):
+        return
+
+    tag = _xml_local_name(str(elem.tag))
+
+    if tag in _EPUB_HEADING_TAGS:
+        text = _epub_clean_block_text(_epub_collect_inline_text(elem))
+        if text and not _epub_is_ignorable_block(elem, text):
+            blocks.append(_ensure_heading_pause_punctuation(text))
+        return
+
+    if tag in _EPUB_BLOCK_TAGS:
+        text = _epub_clean_block_text(_epub_collect_inline_text(elem))
+        if text and not _epub_is_ignorable_block(elem, text):
+            blocks.append(text)
+        return
+
+    if tag == "blockquote":
+        has_block_children = any(
+            _xml_local_name(str(child.tag)) in (_EPUB_HEADING_TAGS | _EPUB_BLOCK_TAGS | {"blockquote"})
+            and not _epub_should_skip_element(child)
+            for child in list(elem)
+        )
+        if not has_block_children:
+            text = _epub_clean_block_text(_epub_collect_inline_text(elem))
+            if text and not _epub_is_ignorable_block(elem, text):
+                blocks.append(text)
+            return
+
+    for child in list(elem):
+        _epub_collect_blocks(child, blocks)
+
+
+def _epub_resolve_zip_path(base_path: str, href: str) -> str:
+    clean_href = str(href or "").split("#", 1)[0].strip()
+    if not clean_href:
+        return ""
+    joined = posixpath.normpath(posixpath.join(posixpath.dirname(base_path), clean_href))
+    return joined.lstrip("/")
+
+
+def _read_epub_package_path(archive: zipfile.ZipFile) -> str:
+    try:
+        container_xml = archive.read("META-INF/container.xml")
+    except KeyError as exc:
+        raise RuntimeError("EPUB is missing META-INF/container.xml") from exc
+    try:
+        root = ET.fromstring(container_xml)
+    except ET.ParseError as exc:
+        raise RuntimeError("EPUB container.xml could not be parsed") from exc
+    for elem in root.iter():
+        if _xml_local_name(str(elem.tag)) != "rootfile":
+            continue
+        full_path = _epub_attr_map(elem).get("full-path", "").strip()
+        if full_path:
+            return full_path.lstrip("/")
+    raise RuntimeError("EPUB container.xml did not include a package document path")
+
+
+def _read_epub_spine_paths(archive: zipfile.ZipFile, package_path: str) -> list[str]:
+    try:
+        package_xml = archive.read(package_path)
+    except KeyError as exc:
+        raise RuntimeError(f"EPUB package document not found: {package_path}") from exc
+    try:
+        root = ET.fromstring(package_xml)
+    except ET.ParseError as exc:
+        raise RuntimeError(f"EPUB package document could not be parsed: {package_path}") from exc
+
+    manifest_by_id: dict[str, tuple[str, str, str]] = {}
+    for elem in root.iter():
+        if _xml_local_name(str(elem.tag)) != "item":
+            continue
+        attrs = _epub_attr_map(elem)
+        item_id = attrs.get("id", "").strip()
+        href = attrs.get("href", "").strip()
+        if not item_id or not href:
+            continue
+        manifest_by_id[item_id] = (
+            href,
+            attrs.get("media-type", "").strip().lower(),
+            attrs.get("properties", "").strip().lower(),
+        )
+
+    spine_paths: list[str] = []
+    seen: set[str] = set()
+    for elem in root.iter():
+        if _xml_local_name(str(elem.tag)) != "itemref":
+            continue
+        attrs = _epub_attr_map(elem)
+        if attrs.get("linear", "yes").strip().lower() == "no":
+            continue
+        idref = attrs.get("idref", "").strip()
+        if not idref or idref not in manifest_by_id:
+            continue
+        href, media_type, properties = manifest_by_id[idref]
+        if "nav" in properties.split():
+            continue
+        if media_type not in {"application/xhtml+xml", "text/html", "application/xml"}:
+            continue
+        zip_path = _epub_resolve_zip_path(package_path, href)
+        if not zip_path or zip_path in seen:
+            continue
+        seen.add(zip_path)
+        spine_paths.append(zip_path)
+    return spine_paths
+
+
+def _extract_epub_text(archive: zipfile.ZipFile, path: str) -> list[str]:
+    try:
+        raw = archive.read(path)
+    except KeyError:
+        return []
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return []
+
+    body_elem: ET.Element | None = None
+    for elem in root.iter():
+        if _xml_local_name(str(elem.tag)) == "body":
+            body_elem = elem
+            break
+    if body_elem is None:
+        body_elem = root
+
+    blocks: list[str] = []
+    _epub_collect_blocks(body_elem, blocks)
+    return blocks
+
+
+def read_epub_file(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            package_path = _read_epub_package_path(archive)
+            spine_paths = _read_epub_spine_paths(archive, package_path)
+            if not spine_paths:
+                raise RuntimeError("EPUB spine is empty or has no readable XHTML content")
+
+            blocks: list[str] = []
+            for content_path in spine_paths:
+                basename = posixpath.basename(content_path).lower()
+                if basename.startswith(("toc", "nav", "contents")):
+                    continue
+                blocks.extend(_extract_epub_text(archive, content_path))
+
+            cleaned_blocks = [block for block in blocks if str(block).strip()]
+            if not cleaned_blocks:
+                raise RuntimeError("No readable text content found in EPUB")
+            return "\n\n".join(cleaned_blocks)
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"Invalid EPUB file (zip read failed): {path}") from exc
+
+
 def read_text_file(path: Path) -> str:
+    if path.suffix.lower() == ".epub":
+        return read_epub_file(path)
     encodings = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
     for encoding in encodings:
         try:
@@ -1882,7 +2192,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create audiobooks from text using MOSS-TTS or Qwen3-TTS voice cloning."
     )
-    parser.add_argument("--text-file", type=Path, help="Input text file.")
+    parser.add_argument(
+        "--text-file",
+        type=Path,
+        help="Input book text file (.txt or .epub).",
+    )
     parser.add_argument(
         "--reference-audio",
         type=str,
