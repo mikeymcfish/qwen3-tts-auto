@@ -1735,8 +1735,9 @@ def _build_chunk_preview_markdown(text: str, max_chars_per_batch: int) -> str:
         cut = "tight" if chars >= int(max_chars_per_batch * 0.9) else ("short" if chars <= max(120, int(max_chars_per_batch * 0.35)) else "normal")
         chapter_label = "yes" if bool(getattr(batch, "starts_chapter", False)) else ""
         p_range = f"{int(getattr(batch, 'start_paragraph', 0)) + 1}-{int(getattr(batch, 'end_paragraph', 0)) + 1}"
+        preview_cell = batch_text.replace("|", "\\|")
         rows.append(
-            f"| {int(getattr(batch, 'index', 0))} | {chars} | {cut} | {chapter_label} | {p_range} | `{batch_text.replace('|', r'\\|')}` |"
+            f"| {int(getattr(batch, 'index', 0))} | {chars} | {cut} | {chapter_label} | {p_range} | `{preview_cell}` |"
         )
     if len(batches) > 50:
         rows.append(f"| ... | ... | ... | ... | ... | ... ({len(batches)-50} more) |")
