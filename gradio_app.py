@@ -2250,6 +2250,286 @@ def apply_monitor_visibility_settings(
     )
 
 
+def _chapter_tag_count(raw_text: str) -> int:
+    return len(re.findall(r"(?i)\[CHAPTER\]", str(raw_text or "")))
+
+
+def _resolve_text_for_analysis(
+    text_input: str,
+    text_file: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    editor_text = str(text_input or "")
+    if editor_text.strip():
+        return editor_text, "editor text", None
+
+    if not text_file:
+        return None, None, None
+
+    try:
+        source = Path(text_file).expanduser().resolve()
+    except Exception as exc:
+        return None, None, f"Could not resolve text file path: {exc}"
+
+    if not source.exists() or not source.is_file():
+        return None, None, f"Text file not found: {source}"
+
+    try:
+        loaded = read_text_file(source)
+    except Exception as exc:
+        return None, None, f"Unable to read text file `{source.name}`: {exc}"
+    return loaded, f"file `{source.name}`", None
+
+
+def _resume_state_chapter_count(resume_state_file: str | None) -> tuple[int, str | None]:
+    if not resume_state_file:
+        return 0, None
+    try:
+        state_path = Path(resume_state_file).expanduser().resolve()
+    except Exception as exc:
+        return 0, f"Could not resolve resume state path: {exc}"
+    if not state_path.exists() or not state_path.is_file():
+        return 0, f"Resume state not found: {state_path}"
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return 0, f"Could not read resume state `{state_path.name}`: {exc}"
+    raw = data.get("chapter_batch_numbers", [])
+    if isinstance(raw, list):
+        count = 0
+        for item in raw:
+            try:
+                if int(item) > 0:
+                    count += 1
+            except Exception:
+                continue
+        return count, None
+    return 0, None
+
+
+def _auto_use_chapters_decision(
+    *,
+    text_for_analysis: str | None,
+    text_source_label: str | None,
+    resume_state_file: str | None,
+) -> tuple[bool, str]:
+    chapter_count = _chapter_tag_count(text_for_analysis or "")
+    if chapter_count > 0:
+        source_label = text_source_label or "text input"
+        plural = "s" if chapter_count != 1 else ""
+        return True, f"Auto-enabled chapter metadata: found {chapter_count} [CHAPTER] tag{plural} in {source_label}."
+
+    resume_chapters, resume_error = _resume_state_chapter_count(resume_state_file)
+    if resume_chapters > 0:
+        plural = "s" if resume_chapters != 1 else ""
+        return True, f"Auto-enabled chapter metadata: resume state contains {resume_chapters} chapter batch marker{plural}."
+
+    if resume_error:
+        return False, f"Chapter metadata auto-detect skipped resume state check: {resume_error}"
+    if text_for_analysis is not None:
+        return False, "Chapter metadata auto-detect: no [CHAPTER] tags found."
+    if resume_state_file:
+        return False, "Chapter metadata auto-detect: no chapter markers found in resume state."
+    return False, "Chapter metadata auto-detect: no text loaded yet."
+
+
+def _build_chapter_data_preview_markdown(text: str, max_chars_per_batch: int) -> str:
+    source_text = str(text or "")
+    if not source_text.strip():
+        return "### Chapter Data\n\nNo text available for chapter analysis."
+    try:
+        paragraphs = split_into_paragraphs(source_text)
+        chapter_titles = extract_chapter_titles_from_raw_text(source_text)
+        batches = build_batches(
+            paragraphs,
+            max_chars_per_batch=max(100, int(max_chars_per_batch)),
+            chapter_titles=chapter_titles,
+        )
+    except Exception as exc:
+        return f"### Chapter Data\n\nError while analyzing chapters: `{exc}`"
+
+    chapter_tag_count = _chapter_tag_count(source_text)
+    chapter_batches = [batch for batch in batches if bool(getattr(batch, "starts_chapter", False))]
+    lines = [
+        "### Chapter Data",
+        "",
+        f"- `[CHAPTER]` tags in source: **{chapter_tag_count}**",
+        f"- Parsed chapter titles: **{len(chapter_titles)}**",
+        f"- Chapter-start batches: **{len(chapter_batches)}**",
+        "",
+        "| batch | title | chars | preview |",
+        "|---:|---|---:|---|",
+    ]
+    for idx, batch in enumerate(chapter_batches[:40], start=1):
+        title = str(getattr(batch, "chapter_title", "") or "").strip() or (
+            chapter_titles[idx - 1].strip() if idx - 1 < len(chapter_titles) else ""
+        )
+        title_cell = title.replace("|", r"\|") if title else "(untitled)"
+        text_preview = str(getattr(batch, "text", "") or "").strip().replace("\n", " / ")
+        if len(text_preview) > 90:
+            text_preview = text_preview[:87] + "..."
+        text_preview = text_preview.replace("|", r"\|")
+        lines.append(
+            f"| {int(getattr(batch, 'index', 0))} | `{title_cell}` | {int(getattr(batch, 'char_count', 0) or 0)} | `{text_preview}` |"
+        )
+    if len(chapter_batches) > 40:
+        lines.append(f"| ... | ... | ... | ... ({len(chapter_batches)-40} more chapter-start batches) |")
+    if not chapter_batches:
+        lines.append("| - | (none) | - | No chapter-start batches detected |")
+    return "\n".join(lines)
+
+
+def preview_generation_plan(
+    text_input: str,
+    text_file: str | None,
+    reference_audio_file: str | None,
+    reference_audio_path: str,
+    reference_text: str,
+    reference_text_file: str | None,
+    x_vector_only_mode: bool,
+    resume_state_file: str | None,
+    output_name: str,
+    run_root: str,
+    max_chars_per_batch: int,
+    pause_ms: int,
+    chapter_pause_ms: int,
+    mp3_quality: int,
+    language: str,
+    tts_backend: str,
+    model_id: str,
+    device: str,
+    dtype: str,
+    attn_implementation: str,
+    inference_batch_size: int,
+    max_new_tokens: int,
+    continuation_chain: bool,
+    continuation_anchor_seconds: float,
+    stop_after_batch: int,
+) -> tuple[str, str, str, str]:
+    notes: list[str] = []
+    command: list[str] = [sys.executable, str(CLI_SCRIPT)]
+
+    text_for_analysis, text_source_label, text_error = _resolve_text_for_analysis(text_input, text_file)
+    if text_error:
+        notes.append(f"text analysis warning: {text_error}")
+
+    if str(text_input or "").strip():
+        command.extend(["--text-file", "<path-to-book-text.txt>"])
+        notes.append("Book text is currently in the editor. Save it to `/text` and replace `<path-to-book-text.txt>` for CLI use.")
+    elif text_file:
+        try:
+            command.extend(["--text-file", str(Path(text_file).expanduser().resolve())])
+        except Exception:
+            command.extend(["--text-file", str(text_file)])
+
+    if resume_state_file:
+        try:
+            command.extend(["--resume-state", str(Path(resume_state_file).expanduser().resolve())])
+        except Exception:
+            command.extend(["--resume-state", str(resume_state_file)])
+
+    reference_audio_value = str(reference_audio_path or "").strip()
+    if not reference_audio_value and reference_audio_file:
+        try:
+            reference_audio_value = str(Path(reference_audio_file).expanduser().resolve())
+        except Exception:
+            reference_audio_value = str(reference_audio_file)
+    if reference_audio_value:
+        command.extend(["--reference-audio", reference_audio_value])
+
+    reference_text_file_value = str(reference_text_file or "").strip()
+    if reference_text_file_value:
+        try:
+            command.extend(["--reference-text-file", str(Path(reference_text_file_value).expanduser().resolve())])
+        except Exception:
+            command.extend(["--reference-text-file", reference_text_file_value])
+    else:
+        sidecar_candidate: Path | None = None
+        if reference_audio_value and not reference_audio_value.lower().startswith(("http://", "https://")):
+            try:
+                sidecar_candidate = Path(reference_audio_value).expanduser().resolve().with_suffix(".txt")
+            except Exception:
+                sidecar_candidate = None
+        if sidecar_candidate and sidecar_candidate.exists():
+            command.extend(["--reference-text-file", str(sidecar_candidate)])
+        elif str(reference_text or "").strip():
+            transcript_text = str(reference_text).strip()
+            if len(transcript_text) > 400:
+                command.extend(["--reference-text", "<paste-reference-transcript>"])
+                notes.append("Reference transcript is long; CLI preview uses `<paste-reference-transcript>` placeholder.")
+            else:
+                command.extend(["--reference-text", transcript_text])
+
+    if x_vector_only_mode:
+        command.append("--x-vector-only-mode")
+
+    auto_use_chapters, auto_chapter_note = _auto_use_chapters_decision(
+        text_for_analysis=text_for_analysis,
+        text_source_label=text_source_label,
+        resume_state_file=resume_state_file,
+    )
+    notes.append(auto_chapter_note)
+
+    output_value = _sanitize_output_name(output_name)
+    command.extend(["--output", output_value])
+    command.extend(
+        [
+            "--run-root",
+            str(Path(run_root or str(DEFAULT_RUN_ROOT)).expanduser()),
+            "--max-chars-per-batch",
+            str(int(max_chars_per_batch)),
+            "--pause-ms",
+            str(int(pause_ms)),
+            "--chapter-pause-ms",
+            str(int(chapter_pause_ms)),
+            "--mp3-quality",
+            str(int(mp3_quality)),
+            "--language",
+            str(language or "Auto"),
+            "--tts-backend",
+            str(tts_backend or DEFAULT_TTS_BACKEND).strip() or DEFAULT_TTS_BACKEND,
+            "--model-id",
+            str(model_id or DEFAULT_MODEL_ID).strip() or DEFAULT_MODEL_ID,
+            "--device",
+            str(device or "cuda:0").strip() or "cuda:0",
+            "--dtype",
+            str(dtype or DEFAULT_DTYPE),
+            "--attn-implementation",
+            str(attn_implementation or DEFAULT_ATTN_IMPLEMENTATION),
+            "--inference-batch-size",
+            str(int(inference_batch_size)),
+            "--max-new-tokens",
+            str(int(max_new_tokens)),
+            "--no-defrag-ui",
+        ]
+    )
+    if auto_use_chapters:
+        command.append("--use-chapters")
+    if continuation_chain:
+        command.extend(
+            [
+                "--continuation-chain",
+                "--continuation-anchor-seconds",
+                str(float(continuation_anchor_seconds)),
+            ]
+        )
+    if stop_after_batch and int(stop_after_batch) > 0:
+        command.extend(["--stop-after-batch", str(int(stop_after_batch))])
+
+    chunk_md = _build_chunk_preview_markdown(text_for_analysis or "", int(max_chars_per_batch))
+    chapter_md = _build_chapter_data_preview_markdown(text_for_analysis or "", int(max_chars_per_batch))
+
+    detail_lines = [
+        "Preview generated.",
+        "",
+        f"- Text source: {text_source_label or 'none'}",
+        f"- Auto chapter metadata: {'ON' if auto_use_chapters else 'OFF'}",
+        *[f"- {note}" for note in notes if note],
+    ]
+    status_md = _build_status_message("Generation Preview", "\n".join(detail_lines))
+    cli_cmd = subprocess.list2cmdline(command)
+    return status_md, chunk_md, chapter_md, cli_cmd
+
+
 def run_generation(
     text_input: str,
     text_file: str | None,
@@ -2265,7 +2545,6 @@ def run_generation(
     pause_ms: int,
     chapter_pause_ms: int,
     mp3_quality: int,
-    use_chapters: bool,
     language: str,
     tts_backend: str,
     model_id: str,
@@ -2511,6 +2790,16 @@ def run_generation(
         if x_vector_only_mode:
             command.append("--x-vector-only-mode")
 
+        text_for_analysis, text_source_label, text_analysis_error = _resolve_text_for_analysis(text_input, text_file)
+        if text_analysis_error:
+            push_log(f"warning: {text_analysis_error}")
+        auto_use_chapters, auto_chapter_note = _auto_use_chapters_decision(
+            text_for_analysis=text_for_analysis,
+            text_source_label=text_source_label,
+            resume_state_file=resume_state_file,
+        )
+        push_log(f"info: {auto_chapter_note}")
+
         output_name = _sanitize_output_name(output_name)
         if not resume_state_path or output_name.strip():
             expected_output = job_root / output_name
@@ -2547,7 +2836,7 @@ def run_generation(
                 "--no-defrag-ui",
             ]
         )
-        if use_chapters:
+        if auto_use_chapters:
             command.append("--use-chapters")
         if continuation_chain:
             command.extend(
@@ -3439,7 +3728,9 @@ def build_demo() -> gr.Blocks:
                                 step=1,
                                 value=0,
                             )
-                            use_chapters = gr.Checkbox(label="Embed chapter metadata", value=True)
+                            gr.Markdown(
+                                "Chapter metadata is auto-enabled when `[CHAPTER]` tags are detected (or chapter markers exist in a resume state)."
+                            )
                             language = gr.Dropdown(
                                 label="Language",
                                 choices=["Auto", "English", "Chinese", "Japanese", "Korean"],
@@ -3568,6 +3859,20 @@ def build_demo() -> gr.Blocks:
                 with gr.Row(elem_classes=["app-shell"]):
                     with gr.Column(scale=3, visible=True) as monitor_graph_panel:
                         gr.Markdown("### 1. Graphical Monitor")
+                        preview_generation_button = gr.Button(
+                            "Preview Chunk / Chapter Data + CLI Command",
+                            variant="secondary",
+                        )
+                        preview_generation_status = gr.Markdown("### Generation Preview\n\nNot generated yet.")
+                        preview_chunk_data = gr.Markdown("### Chunk Data\n\nRun preview to inspect chunking.")
+                        preview_chapter_data = gr.Markdown("### Chapter Data\n\nRun preview to inspect chapter tags and chapter-start batches.")
+                        preview_cli_command = gr.Textbox(
+                            label="CLI Command Preview",
+                            lines=4,
+                            elem_classes=["mono-log"],
+                            interactive=False,
+                            placeholder="Run preview to generate a CLI command.",
+                        )
                         telemetry = gr.HTML(
                             value=_render_telemetry_panel(
                                 log_lines=[],
@@ -3619,7 +3924,6 @@ def build_demo() -> gr.Blocks:
                 pause_ms,
                 chapter_pause_ms,
                 mp3_quality,
-                use_chapters,
                 language,
                 tts_backend,
                 model_id,
@@ -3642,6 +3946,42 @@ def build_demo() -> gr.Blocks:
                 header_progress_panel,
                 run_button,
                 abort_button,
+            ],
+        )
+        preview_generation_button.click(
+            fn=preview_generation_plan,
+            inputs=[
+                text_input,
+                text_file,
+                reference_audio_file,
+                reference_audio_path,
+                reference_text,
+                reference_text_file,
+                x_vector_only_mode,
+                resume_state_file,
+                output_name,
+                run_root,
+                max_chars_per_batch,
+                pause_ms,
+                chapter_pause_ms,
+                mp3_quality,
+                language,
+                tts_backend,
+                model_id,
+                device,
+                dtype,
+                attn_implementation,
+                inference_batch_size,
+                max_new_tokens,
+                continuation_chain,
+                continuation_anchor_seconds,
+                stop_after_batch,
+            ],
+            outputs=[
+                preview_generation_status,
+                preview_chunk_data,
+                preview_chapter_data,
+                preview_cli_command,
             ],
         )
         run_button.click(
