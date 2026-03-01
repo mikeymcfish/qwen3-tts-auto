@@ -229,6 +229,7 @@ Useful options:
 
 - `--overwrite` to patch MP3 in-place
 - `--offset-ms <N>` to shift all chapter starts by a fixed amount
+- `--cbr-kbps <N>` to re-encode as CBR while applying chapters (helps with some VBR-seek/player issues)
 - `--write-ffmeta-only` to only generate repaired ffmetadata
 - `--state /path/to/session_state.json` as an alternative to `--run-dir`
 
