@@ -1962,24 +1962,84 @@ def compute_inter_batch_pause_samples(
     return gap
 
 
+def _part_batch_number_from_path(path: Path) -> int | None:
+    match = re.search(r"batch_(\d+)\.wav$", str(path.name), flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        number = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 1 else None
+
+
+def order_part_paths_by_batch_number(
+    part_paths: list[Path],
+) -> tuple[list[Path], list[int] | None]:
+    if not part_paths:
+        return [], []
+
+    parsed_pairs: list[tuple[int, Path]] = []
+    for path in part_paths:
+        batch_number = _part_batch_number_from_path(path)
+        if batch_number is None:
+            return part_paths, None
+        parsed_pairs.append((batch_number, path))
+
+    parsed_pairs.sort(key=lambda item: item[0])
+    ordered_numbers = [item[0] for item in parsed_pairs]
+    if len(set(ordered_numbers)) != len(ordered_numbers):
+        return part_paths, None
+
+    ordered_paths = [item[1] for item in parsed_pairs]
+    return ordered_paths, ordered_numbers
+
+
 def chapter_time_entries_from_batches(
     chapter_batch_numbers: list[int],
     part_start_samples: list[int],
     sample_rate: int,
+    part_batch_numbers: list[int] | None = None,
 ) -> list[tuple[float, int]]:
     if sample_rate <= 0:
         return []
+    start_sample_by_batch: dict[int, int] = {}
+    if (
+        isinstance(part_batch_numbers, list)
+        and part_batch_numbers
+        and len(part_batch_numbers) == len(part_start_samples)
+    ):
+        for batch_number_raw, start_sample in zip(part_batch_numbers, part_start_samples):
+            try:
+                batch_number = int(batch_number_raw)
+            except (TypeError, ValueError):
+                continue
+            if batch_number < 1:
+                continue
+            if batch_number in start_sample_by_batch:
+                continue
+            start_sample_by_batch[batch_number] = int(start_sample)
+
     chapter_entries: list[tuple[float, int]] = []
     seen_starts: set[int] = set()
     for batch_number in chapter_batch_numbers:
-        index = batch_number - 1
-        if index < 0 or index >= len(part_start_samples):
+        try:
+            batch_number_int = int(batch_number)
+        except (TypeError, ValueError):
             continue
-        start_sample = part_start_samples[index]
+        start_sample: int | None = None
+        if start_sample_by_batch:
+            start_sample = start_sample_by_batch.get(batch_number_int)
+        else:
+            index = batch_number_int - 1
+            if 0 <= index < len(part_start_samples):
+                start_sample = int(part_start_samples[index])
+        if start_sample is None:
+            continue
         if start_sample in seen_starts:
             continue
         seen_starts.add(start_sample)
-        chapter_entries.append((start_sample / float(sample_rate), batch_number))
+        chapter_entries.append((start_sample / float(sample_rate), batch_number_int))
     return sorted(chapter_entries, key=lambda item: item[0])
 
 
@@ -1987,6 +2047,7 @@ def chapter_start_times_from_batches(
     chapter_batch_numbers: list[int],
     part_start_samples: list[int],
     sample_rate: int,
+    part_batch_numbers: list[int] | None = None,
 ) -> list[float]:
     return [
         start_seconds
@@ -1994,6 +2055,7 @@ def chapter_start_times_from_batches(
             chapter_batch_numbers=chapter_batch_numbers,
             part_start_samples=part_start_samples,
             sample_rate=sample_rate,
+            part_batch_numbers=part_batch_numbers,
         )
     ]
 
@@ -3870,10 +3932,21 @@ def main() -> int:
         emit_status("Combining audio parts with pauses...")
         if args.no_defrag_ui:
             emit_progress("combining parts")
+        resolved_part_paths = resolve_paths(run_dir, part_files)
+        ordered_part_paths, ordered_batch_numbers = order_part_paths_by_batch_number(
+            resolved_part_paths
+        )
+        if (
+            ordered_batch_numbers is not None
+            and ordered_batch_numbers != list(range(1, len(ordered_batch_numbers) + 1))
+        ):
+            emit_status(
+                "Part filenames were non-contiguous/non-default; chapter timing will map by explicit batch numbers."
+            )
         sample_rate_out, duration_out, part_start_samples = combine_parts_with_pause(
             sf=sf,
             np=np,
-            part_paths=resolve_paths(run_dir, part_files),
+            part_paths=ordered_part_paths,
             output_wav_path=combined_wav_path,
             pause_ms=pause_ms,
             chapter_batch_numbers=state_chapter_batches,
@@ -3886,6 +3959,7 @@ def main() -> int:
                     chapter_batch_numbers=state_chapter_batches,
                     part_start_samples=part_start_samples,
                     sample_rate=sample_rate_out,
+                    part_batch_numbers=ordered_batch_numbers,
                 )
                 chapter_entries_for_metadata: list[tuple[float, str | None]] = [
                     (

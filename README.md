@@ -174,6 +174,20 @@ Notes:
 - Keep denoise/enhancement conservative; over-processing can hurt voice-clone identity.
 - `arnndn` is supported if your ffmpeg build includes it and you provide a model file.
 
+### AudioSR Pre-Process (Gradio Audio Lab)
+
+The Gradio app now includes an **AudioSR** pre-process block in **Audio Lab -> Pre-Processing**.
+
+- Runs AudioSR super-resolution on a selected reference clip
+- Lets you choose model (`speech` / `basic`), device, DDIM steps, guidance scale, and seed
+- Provides output preview + file download + command log
+- Includes a button to apply the enhanced output as the current reference audio
+
+Install AudioSR in your runtime first (official project):
+
+- https://audioldm.github.io/audiosr/
+- https://github.com/haoheliu/versatile_audio_super_resolution
+
 ## Key Arguments
 
 - `--tts-backend`: `moss-delay`, `moss-local`, `moss-ttsd`, `qwen`, or `auto`.
@@ -202,6 +216,21 @@ Notes:
 - `--chapter-pause-ms`: extra silence before chapter-start chunks.
 - `--use-chapters`: embed MP3 chapter metadata from `[CHAPTER]`.
 - `--no-defrag-ui`: verbose text progress mode.
+
+## Repair Existing MP3 Chapter Metadata
+
+If chapter timecodes in an already-rendered MP3 are wrong, you can rebuild them from run artifacts:
+
+```bash
+python scripts/repair_mp3_chapters_from_run.py --run-dir /path/to/run_dir
+```
+
+Useful options:
+
+- `--overwrite` to patch MP3 in-place
+- `--offset-ms <N>` to shift all chapter starts by a fixed amount
+- `--write-ffmeta-only` to only generate repaired ffmetadata
+- `--state /path/to/session_state.json` as an alternative to `--run-dir`
 
 ## Control Tags
 

@@ -14,13 +14,19 @@ python audiobook_qwen3.py \
   --no-defrag-ui
 
 python audiobook_qwen3.py \
-  --text-file todo/BuddhismAndTwelve.txt \
-  --reference-audio FrankieTreadaway.mp3 \
+  --text-file ItWorks.txt \
+  --reference-audio "/workspace/qwen3-tts-auto/voices/GrahamVerchere.wav" \
   --tts-backend moss-delay \
   --model-id OpenMOSS-Team/MOSS-TTS \
   --inference-batch-size 0 \
   --max-chars-per-batch 2200 \
-  --pause-ms 50 \
+  --pause-ms 0 \
   --use-chapters \
   --chapter-pause-ms 500 \
-  --output BuddhismAndTwelve.mp3 
+  --continuation-anchor-seconds 10.0 \
+  --output ItWorks-GrahamVerchere.mp3 
+
+  --model-id OpenMOSS-Team/MOSS-TTS --device cuda:0 --dtype bfloat16 --attn-implementation sdpa --inference-batch-size 0 --max-new-tokens 4096 --no-defrag-ui --use-chapters --continuation-chain --continuation-anchor-seconds 10.0
+
+audiobook_qwen3.py --text-file "/workspace/qwen3-tts-auto/text/NA.txt" --reference-audio "/workspace/qwen3-tts-auto/voices/noah schnapp - nice.wav" --reference-text-file "/workspace/qwen3-tts-auto/voices/noah schnapp - nice.txt" --output NA.mp3 --run-root /workspace/qwen3-tts-auto/runs --max-chars-per-batch 800 --pause-ms 300 --chapter-pause-ms 1100 --mp3-quality 0 --language Auto --tts-backend moss-delay --model-id OpenMOSS-Team/MOSS-TTS 
+--device cuda:0 --dtype bfloat16 --attn-implementation sdpa --inference-batch-size 0 --max-new-tokens 4096 --no-defrag-ui --use-chapters --continuation-chain --continuation-anchor-seconds 10.0

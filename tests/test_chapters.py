@@ -11,6 +11,7 @@ from audiobook_qwen3 import (
     compute_inter_batch_pause_samples,
     create_continue_assets,
     extract_chapter_titles_from_raw_text,
+    order_part_paths_by_batch_number,
     split_into_paragraphs,
 )
 
@@ -64,6 +65,25 @@ class ChapterMetadataTests(unittest.TestCase):
             sample_rate=1000,
         )
         self.assertEqual(chapter_entries, [(1.0, 2), (4.0, 4)])
+
+    def test_chapter_time_entries_support_explicit_part_batch_numbers(self) -> None:
+        chapter_entries = chapter_time_entries_from_batches(
+            chapter_batch_numbers=[2, 4],
+            part_start_samples=[0, 1800, 3200],
+            part_batch_numbers=[1, 2, 4],
+            sample_rate=1000,
+        )
+        self.assertEqual(chapter_entries, [(1.8, 2), (3.2, 4)])
+
+    def test_order_part_paths_by_batch_number_sorts_when_pattern_matches(self) -> None:
+        paths = [
+            Path("parts") / "batch_00003.wav",
+            Path("parts") / "batch_00001.wav",
+            Path("parts") / "batch_00002.wav",
+        ]
+        ordered_paths, ordered_numbers = order_part_paths_by_batch_number(paths)
+        self.assertEqual([p.name for p in ordered_paths], ["batch_00001.wav", "batch_00002.wav", "batch_00003.wav"])
+        self.assertEqual(ordered_numbers, [1, 2, 3])
 
     def test_ffmetadata_contains_chapter_blocks(self) -> None:
         metadata = build_ffmetadata_with_chapters(

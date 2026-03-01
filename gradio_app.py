@@ -51,6 +51,7 @@ CLI_SCRIPT = APP_ROOT / "audiobook_qwen3.py"
 DEFAULT_RUN_ROOT = APP_ROOT / "runs"
 VOICES_DIR = APP_ROOT / "voices"
 TEXT_LIBRARY_DIR = APP_ROOT / "text"
+DEFAULT_AUDIOSR_OUTPUT_ROOT = DEFAULT_RUN_ROOT / "audiosr_preprocess"
 DEFAULT_VOICEGEN_MODEL_ID = "OpenMOSS-Team/MOSS-VoiceGenerator"
 MAX_LOG_LINES = 500
 PROGRESS_LINE_RE = re.compile(
@@ -2250,6 +2251,211 @@ def apply_monitor_visibility_settings(
     )
 
 
+def _resolve_audio_input_path(
+    input_audio_file: str | None,
+    input_audio_path: str,
+) -> tuple[Path | None, str | None]:
+    if input_audio_file:
+        try:
+            candidate = Path(input_audio_file).expanduser().resolve()
+        except Exception as exc:
+            return None, f"Could not resolve uploaded audio path: {exc}"
+        if not candidate.exists() or not candidate.is_file():
+            return None, f"Uploaded audio file not found: {candidate}"
+        return candidate, None
+
+    path_text = str(input_audio_path or "").strip()
+    if not path_text:
+        return None, "Provide an input audio file or path."
+    try:
+        candidate = Path(path_text).expanduser().resolve()
+    except Exception as exc:
+        return None, f"Could not resolve input audio path: {exc}"
+    if not candidate.exists() or not candidate.is_file():
+        return None, f"Input audio file not found: {candidate}"
+    return candidate, None
+
+
+def _resolve_audiosr_executable() -> str | None:
+    for name in ("audiosr", "audiosr.cmd", "audiosr.exe"):
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+
+    py_parent = Path(sys.executable).resolve().parent
+    candidates = [
+        py_parent / "audiosr.exe",
+        py_parent / "audiosr.cmd",
+        py_parent / "audiosr",
+        py_parent / "Scripts" / "audiosr.exe",
+        py_parent / "Scripts" / "audiosr.cmd",
+        py_parent / "Scripts" / "audiosr",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _find_latest_wav(root: Path, min_mtime: float | None = None) -> Path | None:
+    if not root.exists() or not root.is_dir():
+        return None
+    candidates: list[Path] = []
+    for wav_path in root.rglob("*.wav"):
+        if not wav_path.exists() or not wav_path.is_file():
+            continue
+        if min_mtime is not None:
+            try:
+                if float(wav_path.stat().st_mtime) + 1e-6 < float(min_mtime):
+                    continue
+            except OSError:
+                continue
+        candidates.append(wav_path)
+    if not candidates:
+        return None
+    try:
+        return max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+    except OSError:
+        return candidates[-1].resolve()
+
+
+def _extract_audiosr_output_from_logs(log_lines: list[str]) -> Path | None:
+    path_pattern = re.compile(r"([A-Za-z]:[\\/].+?\.wav|/.+?\.wav|[^\\s]+\.wav)", re.IGNORECASE)
+    for line in reversed(log_lines):
+        if ".wav" not in line.lower():
+            continue
+        for match in path_pattern.finditer(line):
+            raw = match.group(1).strip().strip('"').strip("'")
+            try:
+                candidate = Path(raw).expanduser()
+                if candidate.exists() and candidate.is_file():
+                    return candidate.resolve()
+            except Exception:
+                continue
+    return None
+
+
+def run_audiosr_preprocess(
+    input_audio_file: str | None,
+    input_audio_path: str,
+    output_root: str,
+    model_name: str,
+    device: str,
+    ddim_steps: int,
+    guidance_scale: float,
+    seed: int,
+    suffix: str,
+) -> tuple[str, str | None, str | None, str]:
+    audio_path, audio_error = _resolve_audio_input_path(input_audio_file, input_audio_path)
+    if audio_error or audio_path is None:
+        return _build_status_message("AudioSR Pre-Process", audio_error or "Missing input audio."), None, None, ""
+
+    audiosr_bin = _resolve_audiosr_executable()
+    if not audiosr_bin:
+        detail = (
+            "AudioSR CLI (`audiosr`) is not installed or not in PATH.\n\n"
+            "Install from: https://audioldm.github.io/audiosr/ then restart this app environment."
+        )
+        return _build_status_message("AudioSR Pre-Process", detail), None, None, ""
+
+    output_dir = Path(output_root or str(DEFAULT_AUDIOSR_OUTPUT_ROOT)).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    suffix_value = str(suffix or "_audiosr").strip() or "_audiosr"
+
+    command = [
+        audiosr_bin,
+        "-i",
+        str(audio_path),
+        "-s",
+        str(output_dir),
+        "--model_name",
+        str(model_name or "speech"),
+        "-d",
+        str(device or "auto"),
+        "--ddim_steps",
+        str(int(ddim_steps)),
+        "--guidance_scale",
+        str(float(guidance_scale)),
+        "--seed",
+        str(int(seed)),
+        "--suffix",
+        suffix_value,
+    ]
+
+    logs: list[str] = [f"$ {subprocess.list2cmdline(command)}"]
+    started_at = time.time()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(APP_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        if process.stdout:
+            for line in process.stdout:
+                logs.append(line.rstrip("\n"))
+        exit_code = int(process.wait())
+    except Exception as exc:
+        logs.append(f"ERROR: {exc}")
+        return (
+            _build_status_message("AudioSR Pre-Process", f"Failed to run AudioSR: {exc}"),
+            None,
+            None,
+            "\n".join(logs),
+        )
+
+    enhanced_path = _extract_audiosr_output_from_logs(logs)
+    if enhanced_path is None:
+        enhanced_path = _find_latest_wav(output_dir, min_mtime=started_at)
+    if enhanced_path is None:
+        enhanced_path = _find_latest_wav(output_dir)
+
+    if exit_code != 0:
+        detail = f"AudioSR exited with code {exit_code}. See logs for details."
+        return (
+            _build_status_message("AudioSR Pre-Process", detail),
+            str(enhanced_path) if enhanced_path else None,
+            str(enhanced_path) if enhanced_path else None,
+            "\n".join(logs),
+        )
+
+    if enhanced_path and enhanced_path.exists():
+        detail = f"Enhanced audio created: `{enhanced_path}`"
+        return (
+            _build_status_message("AudioSR Pre-Process", detail),
+            str(enhanced_path),
+            str(enhanced_path),
+            "\n".join(logs),
+        )
+
+    return (
+        _build_status_message(
+            "AudioSR Pre-Process",
+            "AudioSR completed but output file could not be auto-detected. Check logs and output folder.",
+        ),
+        None,
+        None,
+        "\n".join(logs),
+    )
+
+
+def apply_audiosr_output_to_reference(
+    enhanced_audio_path: str | None,
+) -> tuple[str, str]:
+    value = str(enhanced_audio_path or "").strip()
+    if not value:
+        return "", "No AudioSR output selected yet."
+    try:
+        candidate = Path(value).expanduser().resolve()
+    except Exception:
+        return value, "Applied AudioSR output path (unresolved)."
+    if candidate.exists() and candidate.is_file():
+        return str(candidate), f"Applied AudioSR output as reference audio: `{candidate.name}`"
+    return str(candidate), f"Applied AudioSR output path, but file was not found: `{candidate}`"
+
+
 def _chapter_tag_count(raw_text: str) -> int:
     return len(re.findall(r"(?i)\[CHAPTER\]", str(raw_text or "")))
 
@@ -3815,14 +4021,80 @@ def build_demo() -> gr.Blocks:
                 )
                 with gr.Accordion("Pre-Processing (Reference Audio / Text)", open=True):
                     gr.Markdown(
-                        "- Reference audio trimming / cleanup (planned UI wrapper)\n"
-                        "- Transcript normalization and punctuation cleanup (planned)\n"
-                        "- Batch file staging and naming helpers (planned)"
+                        "AudioSR super-resolution enhancement for reference audio.\n\n"
+                        "Source: https://audioldm.github.io/audiosr/ (requires AudioSR installed in this runtime)."
                     )
-                    gr.Textbox(
-                        label="Tool Notes / Scratchpad",
-                        lines=8,
-                        placeholder="Use this area to collect ffmpeg commands, preprocessing notes, or pipeline steps.",
+                    with gr.Row():
+                        audiosr_input_file = gr.File(
+                            label="AudioSR Input Audio File",
+                            file_types=audio_types,
+                            type="filepath",
+                        )
+                        audiosr_input_path = gr.Textbox(
+                            label="AudioSR Input Audio Path (optional)",
+                            placeholder="Use this if not uploading a file.",
+                        )
+                    with gr.Row():
+                        audiosr_output_root = gr.Textbox(
+                            label="AudioSR Output Folder",
+                            value=str(DEFAULT_AUDIOSR_OUTPUT_ROOT.resolve()),
+                        )
+                        audiosr_suffix = gr.Textbox(
+                            label="Output Suffix",
+                            value="_audiosr",
+                        )
+                    with gr.Row():
+                        audiosr_model_name = gr.Dropdown(
+                            label="AudioSR Model",
+                            choices=["speech", "basic"],
+                            value="speech",
+                        )
+                        audiosr_device = gr.Textbox(
+                            label="AudioSR Device",
+                            value="auto",
+                            placeholder="auto or cuda:0",
+                        )
+                        audiosr_ddim_steps = gr.Slider(
+                            label="DDIM Steps",
+                            minimum=10,
+                            maximum=250,
+                            step=5,
+                            value=50,
+                        )
+                    with gr.Row():
+                        audiosr_guidance_scale = gr.Slider(
+                            label="Guidance Scale",
+                            minimum=1.0,
+                            maximum=10.0,
+                            step=0.1,
+                            value=3.5,
+                        )
+                        audiosr_seed = gr.Number(
+                            label="Seed",
+                            value=42,
+                            precision=0,
+                        )
+                    with gr.Row():
+                        audiosr_run_button = gr.Button("Run AudioSR Pre-Process", variant="primary")
+                        audiosr_apply_reference_button = gr.Button(
+                            "Use AudioSR Output As Reference",
+                            variant="secondary",
+                        )
+                    audiosr_status = gr.Markdown("### AudioSR Pre-Process\n\nReady.")
+                    audiosr_output_audio = gr.Audio(
+                        label="AudioSR Output Preview",
+                        type="filepath",
+                        interactive=False,
+                    )
+                    audiosr_output_file = gr.File(
+                        label="AudioSR Output File",
+                        type="filepath",
+                        interactive=False,
+                    )
+                    audiosr_log = gr.Textbox(
+                        label="AudioSR Log",
+                        lines=10,
+                        elem_classes=["mono-log"],
                     )
                 with gr.Accordion("Post-Processing (Output Audio)", open=False):
                     gr.Markdown(
@@ -4446,6 +4718,37 @@ def build_demo() -> gr.Blocks:
                 inputs=[show_graphical_monitor, show_defrag_viewer, show_console_output],
                 outputs=[monitor_graph_panel, monitor_defrag_panel, monitor_console_panel],
             )
+
+        audiosr_run_button.click(
+            fn=run_audiosr_preprocess,
+            inputs=[
+                audiosr_input_file,
+                audiosr_input_path,
+                audiosr_output_root,
+                audiosr_model_name,
+                audiosr_device,
+                audiosr_ddim_steps,
+                audiosr_guidance_scale,
+                audiosr_seed,
+                audiosr_suffix,
+            ],
+            outputs=[
+                audiosr_status,
+                audiosr_output_audio,
+                audiosr_output_file,
+                audiosr_log,
+            ],
+        )
+        audiosr_apply_event = audiosr_apply_reference_button.click(
+            fn=apply_audiosr_output_to_reference,
+            inputs=[audiosr_output_file],
+            outputs=[reference_audio_path, quick_voice_status],
+        )
+        audiosr_apply_event.then(
+            fn=render_generation_readiness_header,
+            inputs=readiness_inputs,
+            outputs=[readiness_header],
+        )
 
     return demo
 
