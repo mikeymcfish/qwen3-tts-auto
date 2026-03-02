@@ -73,10 +73,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cbr-kbps",
         type=int,
+        default=192,
         help=(
-            "Re-encode output MP3 at constant bitrate (e.g. 128, 192, 256, 320) "
-            "instead of stream-copy remux. Useful for players with VBR chapter seek issues."
+            "CBR bitrate for remux output (default: 192). "
+            "Use --copy-audio to skip re-encode and keep original audio packets."
         ),
+    )
+    parser.add_argument(
+        "--copy-audio",
+        action="store_true",
+        help="Use stream-copy remux instead of CBR re-encode.",
     )
     parser.add_argument(
         "--overwrite",
@@ -306,7 +312,7 @@ def _remux_mp3_with_ffmeta(
 
 def main() -> int:
     args = parse_args()
-    if args.cbr_kbps is not None and int(args.cbr_kbps) <= 0:
+    if not args.copy_audio and args.cbr_kbps is not None and int(args.cbr_kbps) <= 0:
         print("ERROR: --cbr-kbps must be a positive integer.", file=sys.stderr)
         return 2
     try:
@@ -388,7 +394,9 @@ def main() -> int:
         print(f"[dry-run] parts={len(ordered_parts)} sample_rate={sample_rate}")
         print(f"[dry-run] chapters={len(chapter_entries_with_titles)} pause_ms={pause_ms} chapter_pause_ms={chapter_pause_ms}")
         print(f"[dry-run] ffmeta_out={ffmeta_out}")
-        if args.cbr_kbps is not None:
+        if args.copy_audio:
+            print("[dry-run] remux_mode=copy")
+        elif args.cbr_kbps is not None:
             print(f"[dry-run] cbr_kbps={int(args.cbr_kbps)}")
         if not args.write_ffmeta_only:
             try:
@@ -419,7 +427,7 @@ def main() -> int:
             output_mp3=output_mp3,
             ffmeta_path=ffmeta_out,
             overwrite=bool(args.overwrite),
-            cbr_kbps=int(args.cbr_kbps) if args.cbr_kbps is not None else None,
+            cbr_kbps=None if args.copy_audio else int(args.cbr_kbps),
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

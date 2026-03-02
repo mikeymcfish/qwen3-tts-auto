@@ -42,6 +42,7 @@ DEFAULT_OUTPUT_NAME = "audiobook.mp3"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_PAUSE_MS = 300
 DEFAULT_CHAPTER_PAUSE_MS = 0
+DEFAULT_CHAPTER_CBR_KBPS = 192
 DEFAULT_MAX_INFERENCE_CHARS = 2600
 DEFAULT_MAX_NEW_TOKENS = 4096
 DEFAULT_CONTINUATION_ANCHOR_SECONDS = 10.0
@@ -2126,6 +2127,7 @@ def convert_wav_to_mp3(
     output_mp3: Path,
     quality_level: int,
     chapter_metadata_path: Path | None = None,
+    chapter_cbr_kbps: int = DEFAULT_CHAPTER_CBR_KBPS,
 ) -> None:
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
@@ -2164,11 +2166,21 @@ def convert_wav_to_mp3(
             "-vn",
             "-codec:a",
             "libmp3lame",
-            "-q:a",
-            str(quality_level),
-            str(output_mp3),
         ]
     )
+    use_cbr_for_chapters = bool(chapter_metadata_path and int(chapter_cbr_kbps) > 0)
+    if use_cbr_for_chapters:
+        cmd.extend(
+            [
+                "-b:a",
+                f"{int(chapter_cbr_kbps)}k",
+                "-write_xing",
+                "0",
+            ]
+        )
+    else:
+        cmd.extend(["-q:a", str(quality_level)])
+    cmd.append(str(output_mp3))
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()

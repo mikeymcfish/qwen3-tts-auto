@@ -215,6 +215,7 @@ Install AudioSR in your runtime first (official project):
 - `--pause-ms`: silence between generated chunks.
 - `--chapter-pause-ms`: extra silence before chapter-start chunks.
 - `--use-chapters`: embed MP3 chapter metadata from `[CHAPTER]`.
+  - When chapters are embedded, MP3 encoding defaults to CBR 192 kbps for better player chapter seek consistency.
 - `--no-defrag-ui`: verbose text progress mode.
 
 ## Repair Existing MP3 Chapter Metadata
@@ -229,7 +230,8 @@ Useful options:
 
 - `--overwrite` to patch MP3 in-place
 - `--offset-ms <N>` to shift all chapter starts by a fixed amount
-- `--cbr-kbps <N>` to re-encode as CBR while applying chapters (helps with some VBR-seek/player issues)
+- `--cbr-kbps <N>` CBR bitrate for repaired output (default: `192`)
+- `--copy-audio` to skip re-encode and do stream-copy chapter remux
 - `--write-ffmeta-only` to only generate repaired ffmetadata
 - `--state /path/to/session_state.json` as an alternative to `--run-dir`
 
